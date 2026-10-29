@@ -1,0 +1,94 @@
+-- Inventory portraits at their true shape. The inventory stretches each
+-- portrait over a fixed box that is wider than 123:87 on most screens
+-- (GAMMA's 99x86 draws them about 9% too wide at 16:9). The box sits in a
+-- frame and compartment painted into the panel art, so it keeps its size;
+-- after UpdateCharacter assigns the textures, each portrait's texture rect is
+-- cropped to the box's on-screen shape instead. Rows are trimmed one third
+-- from the top and two thirds from the bottom, columns evenly. At least
+-- MIN_KEEP of the trimmed side stays: on ultrawide screens, where GAMMA
+-- stretches the whole inventory, the rest of the difference stays a stretch
+-- rather than cutting away half a face. Layout files and artwork are not
+-- touched.
+local hooked, failure_logged = {}, false
+local ICONS = {"player_icon", "npc_icon", "npc_up_icon"}
+local MIN_KEEP = 0.8
+
+local function report(err)
+    if failure_logged then return end
+    failure_logged = true
+    printf("[GAMMA Character Selector] Inventory portrait crop failed: %s", tostring(err))
+end
+
+-- GetTextureRect returns the static's live rect, so its values are copied.
+local function rects(self)
+    local found = {}
+    for _, name in ipairs(ICONS) do
+        local icon = self[name]
+        if icon then
+            local r = icon:GetTextureRect()
+            found[name] = {r.x1, r.y1, r.x2, r.y2}
+        end
+    end
+    return found
+end
+
+local function fit_portrait(icon, before)
+    local rect = icon:GetTextureRect()
+    -- InitTexture replaces the rect only for an ID with a texture
+    -- description; for a raw texture path the engine draws the whole texture
+    -- and resets the rect to it. A rect UpdateCharacter did not replace is
+    -- left alone: no new portrait, or a raw one shown as it always was.
+    if before and rect.x1 == before[1] and rect.y1 == before[2]
+        and rect.x2 == before[3] and rect.y2 == before[4] then return end
+    local tw, th = rect.x2 - rect.x1, rect.y2 - rect.y1
+    local bw = icon:GetWidth() * device().width / 1024
+    local bh = icon:GetHeight() * device().height / 768
+    if tw <= 0 or th <= 0 or bw <= 0 or bh <= 0 then return end
+    local box = bw / bh
+    if math.abs(tw / th - box) <= box * 0.001 then return end
+    local x1, y1, x2, y2 = rect.x1, rect.y1, rect.x2, rect.y2
+    if tw / th < box then
+        local h = math.max(tw / box, th * MIN_KEEP)
+        y1 = rect.y1 + (th - h) / 3
+        y2 = y1 + h
+    else
+        local w = math.max(th * box, tw * MIN_KEEP)
+        x1 = rect.x1 + (tw - w) / 2
+        x2 = x1 + w
+    end
+    icon:SetTextureRect(Frect():set(x1, y1, x2, y2))
+end
+
+local function fit_all(self, before)
+    for _, name in ipairs(ICONS) do
+        local icon = self[name]
+        if icon then fit_portrait(icon, before[name]) end
+    end
+end
+
+-- A failed crop must never break the inventory: report it once and go on.
+local function after(self, before, ...)
+    local ok, err = pcall(fit_all, self, before)
+    if not ok then report(err) end
+    return ...
+end
+
+function install()
+    local class = ui_inventory and ui_inventory.UIInventory
+    local original = class and class.UpdateCharacter
+    if type(original) ~= "function" or hooked[original] then return end
+    local wrapper = function(self, ...)
+        local ok, before = pcall(rects, self)
+        if not ok then
+            report(before)
+            return original(self, ...)
+        end
+        return after(self, before, original(self, ...))
+    end
+    hooked[wrapper] = true
+    class.UpdateCharacter = wrapper
+end
+
+function on_game_start()
+    install()
+end

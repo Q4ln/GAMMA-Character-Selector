@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="windows-1251"?>
+<string_table>
+  <string id="gcs_gender_male"><text>Male</text></string>
+  <string id="gcs_gender_female"><text>Female</text></string>
+  <string id="gcs_load_blocked"><text>This character cannot be loaded. Restore its required pack or choose another save.</text></string>
+  <string id="gcs_choose_save"><text>Choose the save explicitly from the Load Game menu.</text></string>
+  <string id="gcs_azazel_transfer_failed"><text>Character transfer stopped. Load an earlier save; the former character's gear remains in its corpse.</text></string>
+</string_table>

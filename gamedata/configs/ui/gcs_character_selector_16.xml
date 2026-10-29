@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<w>
+  <gcs>
+    <gender_label x="155" y="315" width="48" height="21"><text font="letterica16" r="190" g="190" b="190">st_gcs_gender</text></gender_label>
+    <gender x="207" y="316" width="131" height="21">
+      <list_font font="letterica16" r="190" g="190" b="190"/>
+      <text_color><e r="190" g="190" b="190"/><d r="70" g="70" b="70"/></text_color>
+    </gender>
+    <name_refresh x="323" y="283" width="15" height="20" stretch="1" hint="st_gcs_refresh_name"><texture>ui_inGame2_pda_taskboard_refresh</texture></name_refresh>
+    <popup>
+      <black x="0" y="0" width="1024" height="768" stretch="1"><texture>ui_new_game_black_back</texture></black>
+      <frame x="140" y="150" width="744" height="446">
+        <texture>ui_inGame2_servers_list_frame</texture>
+        <auto_static x="2" y="2" width="740" height="442" stretch="1"><texture a="255" r="18" g="20" b="19">ui_inGame2_white_rect</texture></auto_static>
+      </frame>
+      <heading x="20" y="16" width="704" height="27"><text font="letterica18" r="220" g="220" b="220" align="c"/></heading>
+      <cell_origin x="20" y="60" width="1" height="1"/>
+      <cell_frame x="0" y="0" width="96" height="90"><texture>ui_inGame2_servers_list_frame</texture></cell_frame>
+      <cell_image x="0" y="0" width="90" height="84" stretch="1"/>
+      <cell_button x="0" y="0" width="96" height="90"/>
+      <preview_frame x="454" y="60" width="270" height="294"><texture>ui_inGame2_servers_list_frame</texture></preview_frame>
+      <preview_label x="464" y="70" width="250" height="24"><text font="letterica16" r="190" g="190" b="190" align="c">st_gcs_preview</text></preview_label>
+      <preview x="466" y="104" width="246" height="238" stretch="1"/>
+      <page x="118" y="397" width="218" height="24"><text font="letterica16" r="190" g="190" b="190" align="c"/></page>
+      <previous x="20" y="395" width="84" height="28" stretch="1"><texture>ui_inGame2_button</texture><text font="letterica16" r="190" g="190" b="190" align="c">st_gcs_previous</text></previous>
+      <next x="350" y="395" width="84" height="28" stretch="1"><texture>ui_inGame2_button</texture><text font="letterica16" r="190" g="190" b="190" align="c">st_gcs_next</text></next>
+      <apply x="454" y="395" width="128" height="28" stretch="1"><texture>ui_inGame2_button</texture><text font="letterica16" r="190" g="190" b="190" align="c">st_gcs_apply</text></apply>
+      <cancel x="596" y="395" width="128" height="28" stretch="1"><texture>ui_inGame2_button</texture><text font="letterica16" r="190" g="190" b="190" align="c">st_gcs_cancel</text></cancel>
+    </popup>
+  </gcs>
+</w>

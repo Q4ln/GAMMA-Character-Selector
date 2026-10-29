@@ -1,0 +1,40 @@
+; INACTIVE ADVANCED EXAMPLE.
+; Copy to gamedata/configs/plugins/gcs/packs/83_my_names.ltx to activate.
+; A new profile ID leaves existing gcs_male_names and its saved users unchanged.
+; All listed subsets already exist in the supplied GAMMA system.ltx.
+; Male-based, so it needs only the Character Selector on stock GAMMA.
+; The game removes every space from a value, so no value may need one.
+
+[my_name_profile_package]
+kind = package
+id = my_name_profile_pack
+revision = 1
+requires = gcs
+
+[my_scientist_names_profile]
+kind = profile
+id = my_scientist_names
+type = names
+inherits = gcs_male_names
+revision = 1
+requires = my_name_profile_pack
+default_subsets = science
+military_subsets = private, sergeant, senior_sergeant, lieutenant, captain
+
+; These are the complete lists for this profile, not additions to its parent.
+; Normal factions use science; army, dolg and isg use the military list.
+; literal_name is not needed here and would require a translated string key.
+
+[my_named_gender_definition]
+kind = gender
+id = my_named_gender
+requires = my_name_profile_pack
+label = Researcher
+order = 50
+enabled = true
+inherits = male
+names = my_scientist_names
+
+; Other profiles and portrait pools still come from Male.
+; Keep both new IDs stable after creating a save that uses them.
+; To change future characters only, make another new profile ID and select it.

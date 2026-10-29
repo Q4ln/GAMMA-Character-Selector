@@ -1,0 +1,23 @@
+; INACTIVE EXAMPLE. Copy to gamedata/configs/plugins/gcs/packs/82_my_portraits.ltx.
+; Add existing registered artwork without redefining an existing gender ID.
+; gender = female is registered by the LASS GAMMA Rebase's pack, hence lass.
+
+[my_portrait_additions_package]
+kind = package
+id = my_portrait_additions_pack
+revision = 1
+requires = gcs, lass
+
+[my_portrait_additions_ecolog_pool]
+kind = pool
+gender = female
+faction = ecolog
+requires = my_portrait_additions_pack
+entries = ui_inGame2_ecolog_blue, ui_inGame2_ecolog_orange
+
+; Replace gender with male, your custom gender ID, or * for every gender.
+; For gender = male, requires = gcs is enough.
+; Replace faction with shared for every faction; faction = * is not supported.
+; Replace entries with registered IDs from 20_portrait_pools.ltx.
+; Entries add to existing pools. They do not remove or replace other portraits.
+; Do not add kind = gender / id = female here: that creates a duplicate ID.

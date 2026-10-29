@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="windows-1251"?>
+<string_table>
+  <string id="st_gcs_gender"><text>Пол</text></string>
+  <string id="st_gcs_portraits"><text>Портреты персонажа</text></string>
+  <string id="st_gcs_preview"><text>Предпросмотр</text></string>
+  <string id="st_gcs_selected"><text>Выбрано</text></string>
+  <string id="st_gcs_previous"><text>Назад</text></string>
+  <string id="st_gcs_next"><text>Далее</text></string>
+  <string id="st_gcs_apply"><text>Применить</text></string>
+  <string id="st_gcs_cancel"><text>Отмена</text></string>
+  <string id="st_gcs_unavailable"><text>Недоступно</text></string>
+  <string id="st_gcs_registry_missing"><text>Не хватает файлов выбора персонажа. Проверьте установку мода.</text></string>
+  <string id="st_gcs_gender_invalid"><text>Для начала игры выберите доступный пол</text></string>
+  <string id="st_gcs_portrait_unavailable"><text>Сохранённый портрет недоступен. Выбран первый доступный.</text></string>
+  <string id="st_gcs_empty_pool"><text>Нет портретов для выбранного пола и группировки. Проверьте наборы портретов.</text></string>
+  <string id="st_gcs_start_failed"><text>Не удалось подготовить персонажа</text></string>
+  <string id="gcs_missing_gender"><text>Недоступный пол</text></string>
+  <string id="gcs_azazel_checkpoint_failed"><text>Перенос персонажа завершён, но контрольное сохранение не удалось создать или загрузить. Загрузите более раннее сохранение.</text></string>
+  <string id="gcs_azazel_transfer_incomplete"><text>Перенос персонажа не завершён. Загрузите более раннее сохранение.</text></string>
+  <string id="st_gcs_gender_hint"><text>Пол определяет персонажа и доступные портреты. Он сохраняется до конца этой жизни.</text></string>
+  <string id="st_gcs_unavailable_hint"><text>Этот персонаж недоступен. Выберите другой пол или проверьте установленные наборы персонажей.</text></string>
+  <string id="st_gcs_refresh_name"><text>Подобрать другое имя</text></string>
+  <string id="st_gcs_no_gender"><text>Нет доступного пола для нового персонажа. Включите набор персонажей (для женского пола нужен LASS GAMMA Rebase) и перезапустите игру.</text></string>
+  <string id="st_gcs_package_conflict"><text>Установлены несовместимые файлы персонажей. Зависящие от них персонажи недоступны, пока эти файлы не удалены:</text></string>
+  <string id="gcs_lass_conflict"><text>Установлена старая версия LASS GAMMA Rebase, перезаписывающая файлы игры, или файлы оригинального LASS. Пока они не удалены, создать или загрузить персонажа нельзя. Установите актуальный LASS GAMMA Rebase, чтобы играть за женского персонажа</text></string>
+</string_table>

@@ -1,0 +1,46 @@
+; Character Selector - editable gender definitions.
+; Edit each existing definition HERE. Duplicate IDs in another file are errors.
+; For an additional gender, copy an inactive example from ../examples/ (this
+; mod's gamedata/configs/plugins/gcs/examples/). Guide: the Options section of
+; GAMMA Character Selector - README.md. Restart the game after editing.
+;
+; id       = permanent identity stored in saves; do not rename male/female.
+; label    = translation key, or one plain ASCII word shown in every language.
+; order    = dropdown position (smaller first); saves never store this number.
+; enabled  = false hides new selection while keeping existing saves resolvable.
+; requires = installed package IDs, comma separated; keep required resources.
+; The game removes every space from a value, so no value may need one.
+;
+; Male uses GAMMA's own files and needs no other mod. Female is not defined
+; here: the LASS GAMMA Rebase registers gender female, its lass_female_*
+; profiles, gcs_female_dialogue and the Female portrait pools in its own pack.
+; Do not define female in this file; a duplicate ID disables both copies.
+;
+; Choose each profile independently (* = registered by the Rebase's pack):
+; body     = gamma_male_body      / lass_female_body *
+; voice    = gamma_male_voice     / lass_female_voice *
+; movement = gamma_male_movement  / lass_female_movement *
+; health   = gamma_male_health    / lass_female_health *
+; names    = gcs_male_names       / gcs_female_names
+; dialogue = gcs_male_dialogue    / gcs_female_dialogue *
+;
+; shared names a section in 20_portrait_pools.ltx, not a portrait ID list.
+; Custom genders may use inherits = male for profiles AND pools, inherits =
+; female when the Rebase is installed, or name all six profiles without
+; inherits for independent faction pools.
+; Gender reference changes affect new selections; saves retain profile IDs.
+; The catalog generator preserves this file once created.
+
+[gcs_gender_male]
+kind = gender
+id = male
+label = gcs_gender_male
+requires = gcs
+order = 20
+body = gamma_male_body
+voice = gamma_male_voice
+movement = gamma_male_movement
+health = gamma_male_health
+names = gcs_male_names
+dialogue = gcs_male_dialogue
+shared = gcs_male_shared

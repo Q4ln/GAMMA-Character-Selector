@@ -1,0 +1,166 @@
+<?xml version='1.0' encoding='windows-1251'?>
+<string_table>
+  <string id="st_gcs_templates_button">
+    <text>Presets</text>
+  </string>
+  <string id="st_gcs_templates_title">
+    <text>Character presets</text>
+  </string>
+  <string id="st_gcs_templates_name">
+    <text>Preset</text>
+  </string>
+  <string id="st_gcs_templates_new">
+    <text>New</text>
+  </string>
+  <string id="st_gcs_templates_save">
+    <text>Save</text>
+  </string>
+  <string id="st_gcs_templates_load">
+    <text>Apply</text>
+  </string>
+  <string id="st_gcs_templates_delete">
+    <text>Delete</text>
+  </string>
+  <string id="st_gcs_templates_close">
+    <text>Close</text>
+  </string>
+  <string id="st_gcs_templates_empty">
+    <text>Empty slot</text>
+  </string>
+  <string id="st_gcs_templates_hint">
+    <text>Apply this preset, update it, or choose New to save another setup.</text>
+  </string>
+  <string id="st_gcs_templates_new_hint">
+    <text>Name this setup, then press Save.</text>
+  </string>
+  <string id="st_gcs_templates_full">
+    <text>You have 24 saved presets. Delete one to add another.</text>
+  </string>
+  <string id="st_gcs_templates_selection_changed">
+    <text>The preset list changed. Select a preset again.</text>
+  </string>
+  <string id="st_gcs_templates_empty_state">
+    <text>No saved presets yet.
+Name your current setup above, then press Save.</text>
+  </string>
+  <string id="st_gcs_templates_name_required">
+    <text>Enter a preset name (up to 240 bytes).</text>
+  </string>
+  <string id="st_gcs_templates_storage_error">
+    <text>Preset storage is unavailable.</text>
+  </string>
+  <string id="st_gcs_templates_damaged">
+    <text>This preset cannot be read.</text>
+  </string>
+  <string id="st_gcs_templates_overwrite_confirm">
+    <text>Press Save again to update this preset.</text>
+  </string>
+  <string id="st_gcs_templates_delete_confirm">
+    <text>Press Delete again to remove this preset.</text>
+  </string>
+  <string id="st_gcs_templates_saved">
+    <text>Preset saved.</text>
+  </string>
+  <string id="st_gcs_templates_deleted">
+    <text>Preset deleted.</text>
+  </string>
+  <string id="st_gcs_templates_identity_label">
+    <text>Character</text>
+  </string>
+  <string id="st_gcs_templates_start_detail_label">
+    <text>Start</text>
+  </string>
+  <string id="st_gcs_templates_rules_label">
+    <text>Modes</text>
+  </string>
+  <string id="st_gcs_templates_difficulty_label">
+    <text>Gameplay</text>
+  </string>
+  <string id="st_gcs_templates_economy_label">
+    <text>Progression</text>
+  </string>
+  <string id="st_gcs_templates_location_label">
+    <text>Start</text>
+  </string>
+  <string id="st_gcs_templates_on">
+    <text>On</text>
+  </string>
+  <string id="st_gcs_templates_off">
+    <text>Off</text>
+  </string>
+  <string id="st_gcs_templates_separator">
+    <text>·</text>
+  </string>
+  <string id="st_gcs_templates_lives_label">
+    <text>Lives</text>
+  </string>
+  <string id="st_gcs_templates_regen_label">
+    <text>Life regeneration</text>
+  </string>
+  <string id="st_gcs_templates_timer_label">
+    <text>Save interval</text>
+  </string>
+  <string id="st_gcs_templates_days">
+    <text>days</text>
+  </string>
+  <string id="st_gcs_templates_hours">
+    <text>hours</text>
+  </string>
+  <string id="st_gcs_templates_minutes">
+    <text>min</text>
+  </string>
+  <string id="st_gcs_templates_empty_row">
+    <text>Ready for a new character setup</text>
+  </string>
+  <string id="st_gcs_templates_empty_detail">
+    <text>Save the current character as a new preset</text>
+  </string>
+  <string id="st_gcs_templates_empty_start">
+    <text>Location / difficulty / economy</text>
+  </string>
+  <string id="st_gcs_templates_empty_rules">
+    <text>Enter a name above, then press Save</text>
+  </string>
+  <string id="st_gcs_templates_unspecified">
+    <text>Not specified</text>
+  </string>
+  <string id="st_gcs_templates_legacy_gender">
+    <text>Gender not stored</text>
+  </string>
+  <string id="st_gcs_templates_missing_gender">
+    <text>Unavailable gender</text>
+  </string>
+  <string id="st_gcs_templates_unnamed_character">
+    <text>Unnamed character</text>
+  </string>
+  <string id="st_gcs_templates_freeplay">
+    <text>Freeplay</text>
+  </string>
+  <string id="st_gcs_templates_mode_story">
+    <text>Story</text>
+  </string>
+  <string id="st_gcs_templates_mode_hardcore">
+    <text>Ironman</text>
+  </string>
+  <string id="st_gcs_templates_mode_azazel">
+    <text>Azazel</text>
+  </string>
+  <string id="st_gcs_templates_mode_survival">
+    <text>Survival</text>
+  </string>
+  <string id="st_gcs_templates_mode_warfare">
+    <text>Warfare</text>
+  </string>
+  <string id="st_gcs_templates_mode_soulslike">
+    <text>Soulslike</text>
+  </string>
+  <string id="st_gcs_templates_mode_campfire">
+    <text>Campfire saves</text>
+  </string>
+  <string id="st_gcs_templates_mode_conditions">
+    <text>Agony mode</text>
+  </string>
+  <string id="st_gcs_templates_mode_routes">
+    <text>Accessible Zone</text>
+  </string>
+</string_table>

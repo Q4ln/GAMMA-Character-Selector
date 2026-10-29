@@ -1,0 +1,31 @@
+; INACTIVE EXAMPLE. Copy to gamedata/configs/plugins/gcs/packs/80_my_gender.ltx.
+; Remove only the .example suffix when activating your uniquely named copy.
+; Keep every section and ID unique; do not install two copies of this example.
+; inherits = female needs the LASS GAMMA Rebase: its pack defines gender female.
+; On stock GAMMA without the Rebase, use inherits = male and requires = gcs.
+; The game removes every space from a value, so no value may need one.
+
+[my_inherited_package]
+kind = package
+id = my_inherited_pack
+revision = 1
+requires = gcs, lass
+
+[my_inherited_gender_definition]
+kind = gender
+id = my_inherited_gender
+requires = my_inherited_pack
+label = Custom
+order = 30
+enabled = true
+inherits = female
+
+; Change inherits to male (and requires to gcs) to reuse Male profiles and
+; faction portraits without the Rebase.
+; Optional overrides use existing profile IDs, for example:
+; voice = gamma_male_voice
+; names = gcs_male_names
+; dialogue = gcs_male_dialogue
+; Inherited portrait pools are additive and cannot be subtracted here.
+; Use enabled = false to hide new selection while retaining saved definitions.
+; Keep id and package ID unchanged after creating a save with this gender.

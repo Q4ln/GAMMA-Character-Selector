@@ -1,0 +1,22 @@
+; INACTIVE RECIPE. Every definition below is commented out intentionally.
+; Adding a selectable gender does not require an NPC mapping.
+;
+; Before enabling this recipe:
+; 1. Find the exact specific_character ID of an existing NPC in your installation.
+;    A broad character_profile class, visible name, or portrait ID is not enough.
+; 2. Replace replace_with_verified_specific_character below with that real ID.
+; 3. Replace my_mixed_gender with the installed gender ID to assign to this NPC.
+; 4. Check that no other active mapping assigns that NPC to a different gender.
+; 5. Uncomment this block and activate a uniquely named .ltx file in packs/.
+;
+; [my_verified_npc_mapping]
+; kind = npc_map
+; mapping_type = specific_character
+; entries = my_verified_npc_entries
+;
+; [my_verified_npc_entries]
+; replace_with_verified_specific_character = my_mixed_gender
+;
+; This only classifies the existing NPC for managed Azazel possession.
+; It creates no spawns and does not alter the NPC model, voice, or portrait.
+; Leave the block commented until both the NPC and target gender are verified.

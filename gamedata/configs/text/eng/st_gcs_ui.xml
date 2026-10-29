@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<string_table>
+  <string id="st_gcs_gender"><text>Gender</text></string>
+  <string id="st_gcs_portraits"><text>Character portraits</text></string>
+  <string id="st_gcs_preview"><text>Selected preview</text></string>
+  <string id="st_gcs_selected"><text>Selected</text></string>
+  <string id="st_gcs_previous"><text>Previous</text></string>
+  <string id="st_gcs_next"><text>Next</text></string>
+  <string id="st_gcs_apply"><text>Apply</text></string>
+  <string id="st_gcs_cancel"><text>Cancel</text></string>
+  <string id="st_gcs_unavailable"><text>Unavailable</text></string>
+  <string id="st_gcs_registry_missing"><text>Character Selector is incomplete. Check the installed files.</text></string>
+  <string id="st_gcs_gender_invalid"><text>Choose an available gender to start</text></string>
+  <string id="st_gcs_portrait_unavailable"><text>Saved portrait unavailable. Selected the first valid portrait.</text></string>
+  <string id="st_gcs_empty_pool"><text>No valid portrait for this gender and faction. Check portrait packs.</text></string>
+  <string id="st_gcs_start_failed"><text>Could not prepare the character</text></string>
+  <string id="gcs_missing_gender"><text>Unavailable gender</text></string>
+  <string id="gcs_azazel_checkpoint_failed"><text>Character transfer finished, but its checkpoint save could not be made or loaded. Load an earlier save.</text></string>
+  <string id="gcs_azazel_transfer_incomplete"><text>Character transfer did not complete. Load an earlier save.</text></string>
+  <string id="st_gcs_gender_hint"><text>Gender controls your character and available portraits. It stays fixed for this life.</text></string>
+  <string id="st_gcs_unavailable_hint"><text>This character is unavailable. Choose another gender, or check the installed character packs.</text></string>
+  <string id="st_gcs_refresh_name"><text>Generate another name</text></string>
+  <string id="st_gcs_no_gender"><text>No gender is available for a new character. Enable a character pack (Female needs the LASS GAMMA Rebase) and restart the game.</text></string>
+  <string id="st_gcs_package_conflict"><text>Incompatible character files are installed. Characters that depend on them stay unavailable until they are removed:</text></string>
+  <string id="gcs_lass_conflict"><text>The old overwriting LASS GAMMA Rebase or original LASS files are installed. They overwrite GAMMA's own files, so no character can be created or loaded until they are removed. Install the current LASS GAMMA Rebase to play Female</text></string>
+</string_table>

@@ -1,0 +1,570 @@
+-- Selector-owned creation templates. The legacy section is a read-only import
+-- source, not a dependency on another add-on or its controller extensions.
+local SECTION, LEGACY = "gcs_character_templates_v1", "flx_new_game_templates"
+local LIMIT, CHUNK, MAX_PARTS = 24, 1200, 32
+local fields={"character_name","faction","gender","icon","map","difficulty","economy","money","loadout","story","hardcore","azazel","survival","warfare","campfire","conditions","routes","hardcore_lives","hardcore_regen","timer","soulslike"}
+local modes={story="ck_story",hardcore="ck_hardcore",azazel="ck_azazel_mode",survival="ck_survival",warfare="ck_warfare",campfire="ck_campfire",conditions="ck_conditions",routes="ck_routes",soulslike="ck_soulslike_mode"}
+local mode_order={"story","hardcore","azazel","survival","warfare","soulslike","campfire","conditions","routes"}
+local factions={stalker=true,bandit=true,csky=true,dolg=true,freedom=true,killer=true,army=true,ecolog=true,monolith=true,renegade=true,greh=true,isg=true,zombied=true}
+local installed=false
+local function pack(...) return {n=select("#",...),...} end
+local function tr(id) return game.translate_string("st_gcs_templates_"..id) end
+local function config() return axr_main and axr_main.config end
+local function trim(s) return tostring(s or ""):match("^%s*(.-)%s*$") end
+local function bool(s) return s==true or s=="1" or s=="true" or s=="yes" or s=="on" end
+local function encode(s)
+    return "h2:"..tostring(s or ""):gsub(".",function(c) return string.format("%02X",c:byte()) end)
+end
+local function decode(s)
+    s=tostring(s or "")
+    if s:sub(1,3)~="h2:" then return s end
+    local hex=s:sub(4)
+    if #hex%2~=0 or hex:find("[^%x]") then return nil,"Invalid encoded text" end
+    return (hex:gsub("%x%x",function(pair) return string.char(tonumber(pair,16)) end))
+end
+
+function serialize(data)
+    local parts={"gcs1"}
+    for _,key in ipairs(fields) do parts[#parts+1]=key.."="..encode(data[key]) end
+    local raw=table.concat(parts,"|")
+    if #raw>CHUNK*MAX_PARTS then return nil,"Preset exceeds storage limit" end
+    return raw
+end
+
+function deserialize(raw)
+    if type(raw)~="string" or raw=="" then return nil,"Missing template data" end
+    local own=raw:sub(1,5)=="gcs1|"
+    if own then raw=raw:sub(6) end
+    local result={}
+    for entry in raw:gmatch(raw:find("|",1,true) and "[^|]+" or "[^;]+") do
+        local key,value=entry:match("^([^=]+)=(.*)$")
+        if not key or result[key]~=nil then return nil,"Invalid or duplicate template field" end
+        local decoded,why=decode(value)
+        if not decoded then return nil,why end
+        result[key]=decoded
+    end
+    local version=result.format or "1"
+    if not own and version~="1" and version~="2" and version~="3" then return nil,"Unsupported legacy template format" end
+    if own or version=="3" then
+        for _,key in ipairs(fields) do
+            if result[key]==nil and (own or key~="gender") then return nil,"Incomplete template: "..key end
+        end
+    else
+        if result.loadout then result.loadout=result.loadout:gsub("%%%%%%02X",",") end
+        if result.character_name and result.character_name:find("%%%02X",1,true) then result.character_name="" end
+    end
+    return result
+end
+
+local function value(section,key) return config() and config():r_value(section,key,3) end
+local function read_record(section,prefix)
+    local count=value(section,prefix.."data_parts")
+    if count==nil or count=="" or count=="0" then return deserialize(value(section,prefix.."data")) end
+    count=tonumber(count)
+    if not count or count~=math.floor(count) or count<1 or count>MAX_PARTS then return nil,"Invalid template chunk count" end
+    local chunks={}
+    for i=1,count do
+        local part=value(section,prefix.."data_"..i)
+        if not part or part=="" then return nil,"Missing template chunk" end
+        chunks[i]=part
+    end
+    return deserialize(table.concat(chunks))
+end
+
+local function write_record(prefix,raw)
+    local store=config()
+    store:w_value(SECTION,prefix.."data")
+    local parts=math.ceil(#raw/CHUNK)
+    for i=1,MAX_PARTS do
+        store:w_value(SECTION,prefix.."data_"..i,i<=parts and raw:sub((i-1)*CHUNK+1,i*CHUNK) or nil)
+    end
+    store:w_value(SECTION,prefix.."data_parts",tostring(parts))
+end
+
+function slots()
+    local rows={}
+    for slot=1,LIMIT do
+        local prefix="slot_"..slot.."_"
+        local name=value(SECTION,prefix.."name")
+        local source=SECTION
+        if not name and value(SECTION,prefix.."deleted")~="1" then name=value(LEGACY,prefix.."name");source=LEGACY end
+        if name and name~="" then
+            local decoded,why=decode(name)
+            local data,err=read_record(source,prefix)
+            rows[slot]={name=decoded or tr("damaged"),data=data,error=why or err,legacy=source==LEGACY}
+        end
+    end
+    return rows
+end
+
+function save_slot(slot,name,data)
+    if type(slot)~="number" or slot~=math.floor(slot) or slot<1 or slot>LIMIT then return false,"Invalid template slot" end
+    name=trim(name)
+    if name=="" or #name>240 then return false,tr("name_required") end
+    if not config() then return false,tr("storage_error") end
+    local raw,why=serialize(data)
+    if not raw then return false,why end -- Validate before replacing any existing data.
+    local prefix="slot_"..slot.."_"
+    write_record(prefix,raw)
+    config():w_value(SECTION,prefix.."name",encode(name))
+    config():w_value(SECTION,prefix.."deleted")
+    config():save()
+    return true
+end
+
+function delete_slot(slot)
+    if type(slot)~="number" or slot~=math.floor(slot) or slot<1 or slot>LIMIT or not config() then return false end
+    local prefix="slot_"..slot.."_"
+    config():w_value(SECTION,prefix.."name")
+    config():w_value(SECTION,prefix.."data")
+    config():w_value(SECTION,prefix.."data_parts")
+    for i=1,MAX_PARTS do config():w_value(SECTION,prefix.."data_"..i) end
+    config():w_value(SECTION,prefix.."deleted","1") -- A removed imported slot stays removed.
+    config():save()
+    return true
+end
+
+function last()
+    local source=(value(SECTION,"last_data_parts") or value(SECTION,"last_data")) and SECTION or LEGACY
+    if not value(source,"last_data_parts") and not value(source,"last_data") then return nil end
+    return read_record(source,"last_")
+end
+
+function save_last(data)
+    if not config() then return false,tr("storage_error") end
+    local raw,why=serialize(data)
+    if not raw then return false,why end
+    write_record("last_",raw);config():save();return true
+end
+
+function capture(ui)
+    local data={character_name=ui.character_name and ui.character_name:GetText() or ""}
+    for _,field in ipairs({"faction","gender","icon","map","difficulty","economy","money"}) do data[field]=ui["selected_"..field] end
+    -- Back must not erase an unavailable custom pack's saved portrait while its
+    -- unresolved ID is still selected. An explicit different gender ends this.
+    local unresolved=ui.gcs_t_unresolved
+    if unresolved and unresolved.gender==data.gender and not data.icon then data.icon=unresolved.icon end
+    for key,control in pairs(modes) do data[key]=ui[control] and ui[control]:GetCheck() and "1" or "0" end
+    for _,field in ipairs({"hardcore_lives","hardcore_regen","timer"}) do data[field]=ui["selected_"..field] and ui["selected_"..field][1] end
+    local items={}
+    for _,cell in pairs(ui.CC and ui.CC.inventory and ui.CC.inventory.cell or {}) do
+        if cell:IsShown() then for i=1,cell:CountChilds()+1 do items[#items+1]=cell.section end end
+    end
+    table.sort(items);data.loadout=table.concat(items,",")
+    return data
+end
+
+local function choose(values,wanted,control,structured,regen)
+    if not values or #values==0 then return end
+    local index=1
+    for i,entry in ipairs(values) do
+        local actual=structured and entry[1] or entry
+        if tostring(actual or "")==tostring(wanted or "") then index=i;break end
+    end
+    local selected=values[index]
+    if control then
+        control:SetCurrentIdx(index-1)
+        local caption=selected
+        if structured then
+            local number=selected[1]
+            caption=(number~=nil and tostring(regen and round_idp(number/24) or number) or "").." "..game.translate_string(selected[2])
+        else caption=game.translate_string(tostring(caption)) end
+        control:SetText(caption)
+    end
+    return selected
+end
+
+local function loadout(ui,raw)
+    local inventory=ui.CC and ui.CC.inventory
+    local available=ui.CC and ui.CC.loadout
+    if not inventory or not available then return 0 end
+    local existing,skipped={},0
+    for _,cell in pairs(inventory.cell or {}) do
+        if cell:IsShown() then existing[cell.section]=(existing[cell.section] or 0)+cell:CountChilds()+1 end
+    end
+    for section in tostring(raw or ""):gmatch("[^,]+") do
+        if (existing[section] or 0)>0 then existing[section]=existing[section]-1
+        else
+            local source
+            for _,cell in pairs(available.cell or {}) do if cell:IsShown() and cell.section==section then source=cell;break end end
+            local price=source and source.flags and tonumber(source.flags.value) or 0
+            local budget=tonumber(ui.points_left) or 0
+            local success,destination=false,nil
+            if source and price<=budget then success,destination=pcall(available.TransferItem,available,inventory,nil,section) end
+            if success and destination then
+                price=destination.flags and tonumber(destination.flags.value) or price
+                ui.points_used=(tonumber(ui.points_used) or 0)+price;ui.points_left=budget-price
+            else skipped=skipped+1 end
+        end
+    end
+    if ui.text_points_used then ui.text_points_used:SetText(tostring(ui.points_used)) end
+    if ui.text_points_left then ui.text_points_left:SetText(tostring(ui.points_left)) end
+    return skipped
+end
+
+function apply(ui,data)
+    if type(data)~="table" then return false,tr("damaged") end
+    local faction=factions[data.faction] and data.faction or "stalker"
+    if data.gender and data.gender~="" then gcs_ui.set_gender(ui,data.gender) end
+    ui.selected_economy=choose(ui.table_economy,data.economy,ui.list_economy)
+    local checks={}
+    for name in pairs(modes) do checks[name]=bool(data[name]) end
+    if faction=="zombied" then checks.story=false end
+    if checks.story then checks.azazel=false;checks.survival=false;checks.warfare=false end
+    if checks.warfare then checks.survival=false end
+    if checks.soulslike then checks.azazel=false;checks.hardcore=false end
+    for name,control in pairs(modes) do
+        if ui[control] then ui[control]:SetCheck(checks[name]) end
+        if ui.ck_states then ui.ck_states[control]=false end
+    end
+    if ui.ck_story then ui.ck_story:Enable(faction~="zombied") end
+    ui:UpdateAll(false,faction)
+    gcs_ui.apply(ui,{gender=data.gender,icon=data.icon})
+    ui.gcs_t_unresolved=(data.gender and data.gender~="" and not gcs_registry.validate_gender(data.gender))
+        and {gender=data.gender,icon=data.icon} or nil
+    gcs_ui.restore_name(ui,data.character_name)
+    for index,map in ipairs(ui.table_map or {}) do
+        if map==data.map then
+            ui.selected_map=map;ui.list_map:SetCurrentIdx(index-1)
+            ui.list_map:SetText(game.translate_string("ui_st_"..map));ui:UpdateMap();break
+        end
+    end
+    ui.selected_difficulty=choose(ui.table_difficulty,data.difficulty,ui.list_difficulty)
+    for _,field in ipairs({"hardcore_lives","hardcore_regen","timer"}) do
+        ui["selected_"..field]=choose(ui["table_"..field],data[field],ui["list_"..field],true,field=="hardcore_regen")
+    end
+    local skipped=loadout(ui,data.loadout)
+    if skipped>0 then printf("[GCS Templates] Skipped %s unavailable or unaffordable items",tostring(skipped)) end
+    return true,skipped
+end
+
+local function status(ui,text) if ui.gcs_t_status then ui.gcs_t_status:SetText(text or "") end end
+local function selection(ui)
+    local index=ui.gcs_t_list:GetSelectedIndex()+1
+    return ui.gcs_t_slot_ids and ui.gcs_t_slot_ids[index]
+end
+local function first_free(rows)
+    for slot=1,LIMIT do if not rows[slot] then return slot end end
+end
+local function line(value) return (trim(value):gsub("%s+", " ")) end
+local function translated(value,prefix)
+    value=line(value)
+    if value=="" then return tr("unspecified") end
+    local key=(prefix or "")..value
+    local text=game.translate_string(key)
+    return text~=key and text or value
+end
+
+-- These are display-only summaries. Never normalize or rewrite saved fields
+-- while browsing, including a missing custom gender or Random location.
+local function describe(data)
+    local gender=data.gender and data.gender~="" and gcs_registry.gender_label(data.gender) or tr("legacy_gender")
+    if data.gender and data.gender~="" and not gcs_registry.validate_gender(data.gender) then
+        gender=tr("missing_gender")..": "..line(data.gender)
+    end
+    return table.concat({translated(data.faction,"st_faction_"),line(gender)}," / ")
+end
+
+local function mode_enabled(value) return value==1 or bool(value) end
+
+local function active_interval(value)
+    if value==nil or value==false then return false end
+    local raw=line(value)
+    local normalized=raw:lower()
+    if raw=="" or normalized=="false" or normalized=="no" or normalized=="off" then return false end
+    local number=tonumber(raw)
+    -- Unknown authored values stay readable; numeric disabled intervals do not.
+    return not number or (number==number and number>0 and number<math.huge)
+end
+
+local function limit_value(data,key)
+    local value=data[key]
+    if value==nil then return tr("unspecified") end
+    local raw=line(value)
+    if raw=="" then return tr(key=="hardcore_lives" and "unspecified" or "off") end
+    local number=tonumber(raw)
+    if not number or number~=number or number==math.huge or number==-math.huge then return raw end
+    if key=="hardcore_regen" then
+        if number>0 and number%24==0 then return tostring(number/24).." "..tr("days") end
+        return raw.." "..tr("hours")
+    end
+    if key=="timer" then return raw.." "..tr("minutes") end
+    return raw
+end
+
+local function refresh_actions(ui)
+    local row=ui.gcs_t_rows[selection(ui)]
+    ui.gcs_t_actions.load:Enable(row~=nil and row.data~=nil and not row.error)
+    ui.gcs_t_actions.delete:Enable(row~=nil)
+    ui.gcs_t_actions.save:Enable(row~=nil or first_free(ui.gcs_t_rows)~=nil)
+end
+
+local function image_bounds(control)
+    local p=control:GetWndPos()
+    return {x=p.x,y=p.y,width=control:GetWidth(),height=control:GetHeight()}
+end
+
+local function faction_texture(faction)
+    faction=tostring(faction or ""):gsub("^actor_","")
+    -- Exact new-game emblem IDs, including the authored zombied emblem.
+    return factions[faction] and "ui_new_game_btn_"..faction.."_h" or "ui_inGame2_no_data"
+end
+
+local function fit_faction(control,texture,portrait)
+    local p=portrait:GetWndPos()
+    local width,height=portrait:GetWidth(),portrait:GetHeight()
+    -- Work in the same virtual UI coordinates as fit_texture. Keep the emblem
+    -- inside the actual image, including letterboxed or unusually thin art.
+    local padding=math.min(2,width/4,height/4)
+    local box=image_bounds(control)
+    box.width=math.min(box.width,width-padding*2)
+    box.height=math.min(box.height,height-padding*2)
+    gcs_ui.fit_texture(control,texture,box)
+    control:SetWndPos(vector2():set(p.x+width-control:GetWidth()-padding,p.y+height-control:GetHeight()-padding))
+end
+
+local function refresh_list(ui,selected)
+    -- Visual rows are dense; stored slot IDs remain sparse and never shift.
+    -- Drop old Lua handles before native RemoveAll deletes their owners.
+    ui.gcs_t_rows=slots();ui.gcs_t_row_views={};ui.gcs_t_slot_ids={};ui.gcs_t_list:RemoveAll()
+    local selected_index
+    for slot=1,LIMIT do
+        local row=ui.gcs_t_rows[slot]
+        if row then
+        ui.gcs_t_slot_ids[#ui.gcs_t_slot_ids+1]=slot
+        if slot==selected then selected_index=#ui.gcs_t_slot_ids-1 end
+        local item=ui.gcs_t_list:AddTextItem(line(row.name))
+        item:GetTextItem():Show(false) -- Separate title/character fields below.
+        -- Children remain owned by the native list item. RemoveAll frees the
+        -- complete row; no cached native handles survive a list refresh.
+        local portrait=ui.gcs_t_xml:InitStatic("templates:row_portrait",item)
+        local faction=ui.gcs_t_xml:InitStatic("templates:row_faction",item)
+        local title=ui.gcs_t_xml:InitTextWnd("templates:row_title",item)
+        local character=ui.gcs_t_xml:InitTextWnd("templates:row_character",item)
+        local summary=ui.gcs_t_xml:InitTextWnd("templates:row_summary",item)
+        local difficulty=ui.gcs_t_xml:InitTextWnd("templates:row_difficulty",item)
+        local location=ui.gcs_t_xml:InitTextWnd("templates:row_location",item)
+        local options=ui.gcs_t_xml:InitTextWnd("templates:row_modes",item)
+        local limits=ui.gcs_t_xml:InitTextWnd("templates:row_limits",item)
+        local data=row.data or {}
+        -- Retain the saved icon's native animation in template rows. The
+        -- creation picker's static thumbnail policy is independent.
+        local portrait_id=data.icon and gcs_registry.portrait_exists(data.icon) and data.icon or "ui_inGame2_no_data"
+        gcs_ui.fit_texture(portrait,portrait_id,image_bounds(portrait))
+        fit_faction(faction,faction_texture(data.faction),portrait)
+        title:SetText(line(row.name));title:SetEllipsis(true)
+        local name=line(data.character_name)
+        character:SetText(name~="" and name or tr("unnamed_character"));character:SetEllipsis(true)
+        local detail=(row.error or not row.data) and tr("damaged") or describe(row.data)
+        summary:SetText(detail);summary:SetEllipsis(true)
+        difficulty:SetText(tr("difficulty_label")..": "..translated(data.difficulty).." / "..tr("economy_label")..": "..translated(data.economy))
+        difficulty:SetEllipsis(true)
+        location:SetText(tr("location_label")..": "..translated(data.map,"ui_st_"));location:SetEllipsis(true)
+        local enabled={}
+        for _,key in ipairs(mode_order) do
+            if mode_enabled(data[key]) then enabled[#enabled+1]=tr("mode_"..key) end
+        end
+        -- One native text flow uses the actual font and available width. There
+        -- are no reserved columns or per-option positions to leave gaps.
+        -- Native string loading trims surrounding XML whitespace. Apply the
+        -- separator spacing here so it survives that translation step.
+        local separator="  "..tr("separator").."  "
+        options:SetTextComplexMode(true);options:SetEllipsis(false)
+        options:SetText(table.concat(enabled,separator));options:Show(#enabled>0)
+        if #enabled>0 then options:AdjustHeightToText() end
+        local relevant={}
+        if mode_enabled(data.hardcore) then
+            relevant[#relevant+1]=tr("lives_label")..": "..limit_value(data,"hardcore_lives")
+            if active_interval(data.hardcore_regen) then relevant[#relevant+1]=tr("regen_label")..": "..limit_value(data,"hardcore_regen") end
+        end
+        if active_interval(data.timer) then relevant[#relevant+1]=tr("timer_label")..": "..limit_value(data,"timer") end
+        limits:SetTextComplexMode(true);limits:SetEllipsis(false)
+        limits:SetText(table.concat(relevant,separator));limits:Show(#relevant>0)
+        -- New list items have not been laid out yet. Native RecalcSize reads
+        -- their final heights, so each card can end after its visible content.
+        local bottom=0
+        local function include(control)
+            local p=control:GetWndPos()
+            bottom=math.max(bottom,p.y+control:GetHeight())
+        end
+        for _,control in ipairs({portrait,faction,title,character,summary,difficulty,location}) do include(control) end
+        if #enabled>0 then include(options) end
+        if #relevant>0 then
+            local p=options:GetWndPos()
+            limits:SetWndPos(vector2():set(p.x,p.y+(#enabled>0 and options:GetHeight()+3 or 0)))
+            limits:AdjustHeightToText()
+            include(limits)
+        end
+        item:SetWndSize(vector2():set(item:GetWidth(),bottom+6))
+        ui.gcs_t_row_views[slot]={title=title,character=character,summary=summary,difficulty=difficulty,location=location,modes=options,limits=limits,portrait=portrait,faction=faction}
+        end
+    end
+    -- selected=false explicitly enters New mode; nil selects the first record.
+    if selected~=false and selected_index==nil and #ui.gcs_t_slot_ids>0 then selected_index=0 end
+    ui.gcs_t_list:SetSelectedIndex(selected_index or #ui.gcs_t_slot_ids)
+    local row=ui.gcs_t_rows[selection(ui)]
+    ui.gcs_t_name:SetText(row and row.name or "");ui.gcs_t_confirm=nil
+    ui.gcs_t_empty:Show(#ui.gcs_t_slot_ids==0)
+    refresh_actions(ui)
+end
+
+function new_selected(ui)
+    refresh_list(ui,false)
+    ui.gcs_t_name:CaptureFocus(true)
+    status(ui,tr(first_free(ui.gcs_t_rows) and "new_hint" or "full"))
+end
+
+local function same_record(left,right)
+    if not left or not right then return left==nil and right==nil end
+    return left.name==right.name and left.error==right.error
+        and (left.data and serialize(left.data) or "")== (right.data and serialize(right.data) or "")
+end
+
+local function current_selection(ui,rows)
+    local slot=selection(ui)
+    if slot and not same_record(ui.gcs_t_rows[slot],rows[slot]) then
+        refresh_list(ui);status(ui,tr("selection_changed"));return nil,false
+    end
+    return slot,true
+end
+
+function show(ui,open)
+    if not ui.gcs_t_frame then return end
+    if open then
+        if not ui.access then return end
+        ui.gcs_t_open=true;ui.access=false
+        refresh_list(ui);status(ui,tr(selection(ui) and "hint" or "new_hint"))
+    else ui.gcs_t_open=false;ui.access=true end
+    ui.gcs_t_confirm=nil
+    ui.gcs_t_name:CaptureFocus(open)
+    ui.gcs_t_black:Show(open);ui.gcs_t_frame:Show(open)
+end
+
+local function confirm(ui,action,slot,name)
+    local key=action..":"..tostring(slot)..":"..tostring(name or "")
+    if ui.gcs_t_confirm==key then ui.gcs_t_confirm=nil;return true end
+    ui.gcs_t_confirm=key;status(ui,tr(action.."_confirm"));return false
+end
+
+function save_selected(ui)
+    local name=trim(ui.gcs_t_name:GetText())
+    if name=="" then status(ui,tr("name_required"));return false end
+    local rows=slots()
+    local slot,current=current_selection(ui,rows)
+    if not current then return false end
+    slot=slot or first_free(rows)
+    if not slot then status(ui,tr("full"));return false end
+    if rows[slot] and not confirm(ui,"overwrite",slot,name) then return false end
+    local ok,why=save_slot(slot,name,capture(ui))
+    status(ui,ok and tr("saved") or why)
+    if ok then refresh_list(ui,slot) end
+    return ok
+end
+
+function delete_selected(ui)
+    local rows=slots()
+    local slot,current=current_selection(ui,rows)
+    if not current or not slot or not rows[slot] then return false end
+    if not confirm(ui,"delete",slot) then return false end
+    local ok=delete_slot(slot);refresh_list(ui);status(ui,tr("deleted"));return ok
+end
+
+function load_selected(ui)
+    local rows=slots()
+    local slot,current=current_selection(ui,rows)
+    if not current then return false end
+    local row=rows[slot]
+    if not row or not row.data or row.error then status(ui,tr("damaged"));return false end
+    show(ui,false)
+    return apply(ui,row.data)
+end
+
+local function init_controls(ui)
+    local xml=CScriptXmlInit();xml:ParseFile("gcs_templates.xml")
+    ui.gcs_t_xml=xml
+    ui.gcs_t_button=xml:Init3tButton("templates:button",ui.dialog);ui:Register(ui.gcs_t_button,"gcs_templates")
+    ui.gcs_t_black=xml:InitStatic("templates:black",ui)
+    ui.gcs_t_frame=xml:InitFrame("templates:frame",ui)
+    xml:InitTextWnd("templates:title",ui.gcs_t_frame)
+    xml:InitTextWnd("templates:name_label",ui.gcs_t_frame)
+    ui.gcs_t_name=xml:InitEditBox("templates:name",ui.gcs_t_frame)
+    ui:Register(ui.gcs_t_name,"gcs_template_name")
+    ui.gcs_t_list=xml:InitListBox("templates:list",ui.gcs_t_frame);ui.gcs_t_list:ShowSelectedItem(true)
+    ui.gcs_t_empty=xml:InitTextWnd("templates:empty_state",ui.gcs_t_frame)
+    ui.gcs_t_status=xml:InitTextWnd("templates:status",ui.gcs_t_frame)
+    ui:Register(ui.gcs_t_list,"gcs_template_list")
+    ui.gcs_t_actions={}
+    for _,name in ipairs({"new","save","load","delete","close"}) do
+        local button=xml:Init3tButton("templates:"..name,ui.gcs_t_frame)
+        ui.gcs_t_actions[name]=button
+        ui:Register(button,"gcs_template_"..name)
+    end
+    ui.gcs_t_black:Show(false);ui.gcs_t_frame:Show(false);ui.gcs_t_name:CaptureFocus(false)
+end
+
+local function init_callbacks(ui)
+    local function add(id,fn,event) ui:AddCallback(id,event or ui_events.BUTTON_CLICKED,fn,ui) end
+    add("gcs_templates",function(self) show(self,true) end)
+    add("gcs_template_close",function(self) show(self,false) end)
+    add("gcs_template_new",new_selected)
+    add("gcs_template_save",save_selected);add("gcs_template_load",load_selected);add("gcs_template_delete",delete_selected)
+    add("gcs_template_list",function(self)
+        local rows=slots()
+        local slot,current=current_selection(self,rows)
+        if not current then return end
+        local row=rows[slot]
+        self.gcs_t_name:SetText(row and row.name or "");self.gcs_t_confirm=nil
+        refresh_actions(self)
+        status(self,row and row.error and tr("damaged") or tr("hint"))
+    end,ui_events.LIST_ITEM_CLICKED)
+end
+
+function install()
+    if installed then return end
+    local class=ui_mm_faction_select and ui_mm_faction_select.UINewGame
+    local menu=ui_main_menu and ui_main_menu.main_menu
+    if not class or not menu then return end
+    installed=true
+    local controls,callbacks=class.Main_Controls,class.Main_CallBacks
+    class.Main_Controls=function(self,...) local r=pack(controls(self,...));init_controls(self);return unpack(r,1,r.n) end
+    class.Main_CallBacks=function(self,...) local r=pack(callbacks(self,...));init_callbacks(self);return unpack(r,1,r.n) end
+    local keyboard,quit=class.OnKeyboard,class.OnQuit
+    class.OnKeyboard=function(self,dik,action,...)
+        if self.gcs_t_open then
+            if dik==DIK_keys.DIK_ESCAPE and action==ui_events.WINDOW_KEY_PRESSED then show(self,false);return true end
+            return CUIScriptWnd.OnKeyboard(self,dik,action,...)
+        end
+        return keyboard(self,dik,action,...)
+    end
+    class.OnQuit=function(self,...)
+        if self.gcs_t_open then show(self,false);return end
+        if self.access then
+            local ok,why=save_last(capture(self));if not ok then printf("[GCS Templates] Last setup not saved: %s",tostring(why)) end
+        end
+        return quit(self,...)
+    end
+    local start=class.OnStartGame
+    class.OnStartGame=function(self,...)
+        if not self.access then return start(self,...) end
+        self.gcs_t_start=capture(self)
+        local r=pack(pcall(start,self,...));self.gcs_t_start=nil
+        if not r[1] then error(r[2]) end
+        return unpack(r,2,r.n)
+    end
+    local open,start_game=menu.ShowFactionUI,menu.StartGame
+    menu.ShowFactionUI=function(self,...)
+        local r=pack(open(self,...))
+        local data,why=last()
+        if data and self.new_game_dlg then apply(self.new_game_dlg,data)
+        elseif why then printf("[GCS Templates] Last setup unresolved: %s",tostring(why)) end
+        return unpack(r,1,r.n)
+    end
+    menu.StartGame=function(self,...)
+        local snapshot=self.new_game_dlg and self.new_game_dlg.gcs_t_start
+        local r=pack(start_game(self,...))
+        if snapshot and r[1]~=false then
+            local ok,why=save_last(snapshot);if not ok then printf("[GCS Templates] Last setup not saved: %s",tostring(why)) end
+        end
+        return unpack(r,1,r.n)
+    end
+end

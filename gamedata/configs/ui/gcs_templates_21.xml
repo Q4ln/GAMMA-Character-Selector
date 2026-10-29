@@ -1,0 +1,84 @@
+<?xml version='1.0' encoding='utf-8'?>
+<w>
+  <templates>
+    <button x="669" y="591" width="136" height="27" stretch="1">
+      <texture>ui_inGame2_button</texture>
+      <text font="letterica16" r="200" g="200" b="200" align="c" vert_align="c" complex_mode="1">st_gcs_templates_button</text>
+    </button>
+    <black x="0" y="0" width="1024" height="768" stretch="1">
+      <texture>ui_new_game_black_back</texture>
+    </black>
+    <frame x="232" y="60" width="560" height="648">
+      <texture>ui_inGame2_servers_list_frame</texture>
+      <auto_static x="2" y="2" width="556" height="644" stretch="1">
+        <texture a="255" r="18" g="20" b="19">ui_inGame2_white_rect</texture>
+      </auto_static>
+    </frame>
+    <title x="16" y="14" width="528" height="28">
+      <text font="letterica18" r="214" g="199" b="166" align="c" vert_align="c" complex_mode="1">st_gcs_templates_title</text>
+    </title>
+    <name_label x="16" y="58" width="68" height="24">
+      <text font="letterica16" r="200" g="200" b="200" align="l" vert_align="c" complex_mode="1">st_gcs_templates_name</text>
+    </name_label>
+    <name x="88" y="57" width="358" height="25">
+      <texture>ui_inGame2_edit_box_2</texture>
+      <text font="letterica16" r="200" g="200" b="200" align="l" vert_align="c" complex_mode="0" />
+    </name>
+    <new x="454" y="57" width="90" height="25" stretch="1">
+      <texture>ui_inGame2_button</texture>
+      <text font="letterica16" r="200" g="200" b="200" align="c" vert_align="c" complex_mode="1">st_gcs_templates_new</text>
+    </new>
+    <list x="16" y="96" width="528" height="432" item_height="216" can_select="1" always_show_scroll="0">
+      <font font="letterica16" r="200" g="200" b="200" />
+    </list>
+    <empty_state x="38" y="158" width="483" height="110">
+      <text font="letterica16" r="172" g="179" b="164" align="c" vert_align="c" complex_mode="1">st_gcs_templates_empty_state</text>
+    </empty_state>
+    <row_portrait x="5" y="5" width="101" height="86" stretch="1">
+      <texture>ui_inGame2_no_data</texture>
+    </row_portrait>
+    <row_faction x="0" y="0" width="22" height="28" stretch="1">
+      <texture>ui_inGame2_no_data</texture>
+    </row_faction>
+    <row_title x="120" y="3" width="381" height="23">
+      <text font="letterica18" r="214" g="199" b="166" align="l" vert_align="c" complex_mode="0" />
+    </row_title>
+    <row_character x="120" y="27" width="381" height="22">
+      <text font="letterica16" r="224" g="222" b="210" align="l" vert_align="c" complex_mode="0" />
+    </row_character>
+    <row_summary x="120" y="49" width="381" height="20">
+      <text font="letterica16" r="145" g="155" b="145" align="l" vert_align="c" complex_mode="0" />
+    </row_summary>
+    <row_difficulty x="120" y="71" width="381" height="19">
+      <text font="letterica16" r="172" g="179" b="164" align="l" vert_align="c" complex_mode="0" />
+    </row_difficulty>
+    <row_location x="120" y="93" width="381" height="20">
+      <text font="letterica16" r="172" g="179" b="164" align="l" vert_align="c" complex_mode="0" />
+    </row_location>
+    <row_modes x="120" y="120" width="381" height="21" complex_mode="1">
+      <text font="letterica16" r="172" g="179" b="164" align="l" vert_align="c" complex_mode="1" />
+    </row_modes>
+    <row_limits x="120" y="144" width="381" height="20" complex_mode="1">
+      <text font="letterica16" r="199" g="203" b="193" align="l" vert_align="c" complex_mode="1" />
+    </row_limits>
+    <status x="16" y="540" width="528" height="36">
+      <text font="letterica16" r="172" g="179" b="164" align="c" vert_align="c" complex_mode="1" />
+    </status>
+    <save x="16" y="596" width="125" height="28" stretch="1">
+      <texture>ui_inGame2_button</texture>
+      <text font="letterica16" r="200" g="200" b="200" align="c" vert_align="c" complex_mode="1">st_gcs_templates_save</text>
+    </save>
+    <load x="150" y="596" width="125" height="28" stretch="1">
+      <texture>ui_inGame2_button</texture>
+      <text font="letterica16" r="200" g="200" b="200" align="c" vert_align="c" complex_mode="1">st_gcs_templates_load</text>
+    </load>
+    <delete x="285" y="596" width="125" height="28" stretch="1">
+      <texture>ui_inGame2_button</texture>
+      <text font="letterica16" r="200" g="200" b="200" align="c" vert_align="c" complex_mode="1">st_gcs_templates_delete</text>
+    </delete>
+    <close x="419" y="596" width="125" height="28" stretch="1">
+      <texture>ui_inGame2_button</texture>
+      <text font="letterica16" r="200" g="200" b="200" align="c" vert_align="c" complex_mode="1">st_gcs_templates_close</text>
+    </close>
+  </templates>
+</w>

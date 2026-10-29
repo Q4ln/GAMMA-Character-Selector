@@ -1,0 +1,394 @@
+-- Preloaded native aliases and exact-ID Lua translation routing. No shared
+-- string table mutation, language reload, HUD rebuild or global UI events.
+local selected, selected_key = nil, "unmanaged"
+local dirty, refreshing = false, false
+local catalog, catalog_errors, authored_ids = nil, {}, {}
+local loaded_aliases, missing_alias_warnings = {}, {}
+local original_translate
+local prepare_catalog
+local provider_texts, dialog_files = {}, nil
+local alias_sources = {}
+
+function profile_error(id)
+    prepare_catalog()
+    return catalog_errors[id]
+end
+
+local function profile_key(profile)
+    if not profile then return "unmanaged" end
+    return profile.id .. ":" .. tostring(profile.revision) .. ":" .. tostring(profile.text_source) .. ":" .. tostring(profile.text_provider)
+end
+
+-- A pack's text_provider script supplies text the pack LTX cannot hold.
+-- The registry validates it; each language is fetched once and cached here.
+local function provided(profile, lang)
+    local name = profile and profile.text_provider
+    if type(name) ~= "string" then return nil end
+    provider_texts[name] = provider_texts[name] or {}
+    local cached = provider_texts[name][lang]
+    if cached == nil then
+        local values = gcs_registry and gcs_registry.text_provider_texts and gcs_registry.text_provider_texts(name, lang)
+        cached = type(values) == "table" and values or false
+        provider_texts[name][lang] = cached
+    end
+    return cached or nil
+end
+
+function select(profile)
+    install()
+    local key = profile_key(profile)
+    local changed = selected_key ~= key
+    if changed then dirty = true end
+    selected, selected_key = profile, key
+    -- Engine windows built from settings (the PDA ranking window) read their
+    -- string IDs when the HUD loads, after this load-time selection.
+    if changed and gcs_native_text and gcs_native_text.reconcile then gcs_native_text.reconcile() end
+end
+
+function profile() return selected end
+
+local function language()
+    return system_ini():r_string("string_table", "language")
+end
+
+local function profile_texts(profile, lang)
+    local result = {}
+    if not profile then return result end
+    for id, value in pairs(gcs_builtin_dialogue.get(profile.text_source, lang)) do result[id] = value end
+    for id, value in pairs(provided(profile, lang) or {}) do result[id] = value end
+    for id, value in pairs(profile["text_" .. lang] or {}) do result[id] = value end
+    return result
+end
+
+function texts(lang) return profile_texts(selected, lang) end
+
+function text(id, lang)
+    lang = lang or language()
+    if selected and selected["text_" .. lang] and selected["text_" .. lang][id] then return selected["text_" .. lang][id] end
+    local supplied = provided(selected, lang)
+    if supplied and supplied[id] then return supplied[id] end
+    local values = selected and gcs_builtin_dialogue.get(selected.text_source, lang) or {}
+    return values[id]
+end
+
+local function alias(profile, id)
+    return "gcs_phrase_" .. profile.id .. "_" .. id
+end
+
+prepare_catalog = function()
+    if catalog then return end
+    catalog = {eng = {}, rus = {}}
+    local owners = {eng = {}, rus = {}}
+    local profiles = gcs_registry.list_profiles("dialogue")
+    local function add(profile, lang, id, value)
+        if catalog[lang][id] and catalog[lang][id] ~= value then
+            local reason = "Conflicting preloaded dialogue alias: " .. id
+            catalog_errors[profile.id] = reason
+            for owner in pairs(owners[lang][id]) do catalog_errors[owner] = reason end
+        else
+            catalog[lang][id] = value
+        end
+        owners[lang][id] = owners[lang][id] or {}
+        owners[lang][id][profile.id] = true
+    end
+    for _, profile in ipairs(profiles) do
+        for _, lang in ipairs({"eng", "rus"}) do
+            local values = profile_texts(profile, lang)
+            for id, value in pairs(values) do
+                authored_ids[id] = true
+                alias_sources[alias(profile, id)] = id
+                add(profile, lang, alias(profile, id), value)
+            end
+            if gcs_npc_audio and gcs_npc_audio.aliases then
+                for new_id, old_id in pairs(gcs_npc_audio.aliases(profile) or {}) do
+                    if values[old_id] then add(profile, lang, new_id, values[old_id]) end
+                end
+            end
+        end
+    end
+    -- Conflicting author-supplied audio alias IDs cannot represent different
+    -- text in one native table. Reject every affected profile before selection.
+    for id, why in pairs(catalog_errors) do printf("[GCS] Dialogue profile %s: %s", id, why) end
+    for _, lang in ipairs({"eng", "rus"}) do
+        for id, profiles_by_id in pairs(owners[lang]) do
+            for profile_id in pairs(profiles_by_id) do
+                if catalog_errors[profile_id] then catalog[lang][id] = nil; break end
+            end
+        end
+    end
+end
+
+local function available_alias(id)
+    local lang = language()
+    if loaded_aliases[lang] and loaded_aliases[lang][id] then return true end
+    -- Full ALife loads restart Lua while CStringTable's static native data can
+    -- survive. Rehydrate through the prior native translator, never rebuild it.
+    if original_translate and original_translate(id) ~= id then
+        loaded_aliases[lang] = loaded_aliases[lang] or {}
+        loaded_aliases[lang][id] = true
+        return true
+    end
+    return false
+end
+
+local function require_alias(id)
+    if available_alias(id) then return id end
+    if not missing_alias_warnings[id] then
+        printf("[GCS] Native dialogue alias was not loaded at startup; restart after installing its pack: %s", id)
+        missing_alias_warnings[id] = true
+    end
+end
+
+function install()
+    if original_translate then prepare_catalog(); return end
+    original_translate = game.translate_string
+    game.translate_string = function(id, ...)
+        if selected and type(id) == "string" and text(id) ~= nil then
+            local target = require_alias(alias(selected, id))
+            if target then return original_translate(target, ...) end
+        end
+        return original_translate(id, ...)
+    end
+    prepare_catalog()
+end
+
+local function known_text(id)
+    if not id then return false end
+    if gcs_builtin_dialogue.origins("eng")[id] or gcs_builtin_dialogue.origins("rus")[id] then return true end
+    prepare_catalog()
+    return authored_ids[id] == true
+end
+
+function native_id(id, speaker)
+    if not selected or type(id) ~= "string" then return id end
+    if gcs_npc_audio and gcs_npc_audio.native_id then
+        local mapped = gcs_npc_audio.native_id(id, selected, speaker)
+        if mapped and mapped ~= id then return require_alias(mapped) or id end
+    end
+    local replacement = text(id)
+    if replacement then
+        -- Text and audio share the native phrase ID. Explicit authored audio
+        -- routes above retain their exact asset IDs; absent suitable clips stay
+        -- text-only. Male (the empty gcs_male source) has no replacement here,
+        -- so its phrases keep their own native IDs and GAMMA's winning text.
+        return require_alias(alias(selected, id)) or id
+    end
+    return id
+end
+
+-- Text the engine draws through CStringTable itself (SetTextST, settings read
+-- by an engine window) is given the current profile's preloaded alias. An ID
+-- whose alias would draw the same native string stays unchanged, and a profile
+-- with no text for an ID (Male: gcs_male is empty) leaves it exactly as stock.
+function display_id(id)
+    if not selected or type(id) ~= "string" or id == "" or text(id) == nil then return id end
+    install()
+    local target = require_alias(alias(selected, id))
+    if not target or original_translate(target) == original_translate(id) then return id end
+    return target
+end
+
+-- The shared string ID behind a value display_id may have written.
+function source_id(value)
+    prepare_catalog()
+    return alias_sources[value] or value
+end
+
+local function resolve_functor(path)
+    local value = _G
+    for key in tostring(path):gmatch("[^%.]+") do
+        value = value and value[key]
+    end
+    return type(value) == "function" and value or nil
+end
+
+local function encode(value)
+    return tostring(value or ""):gsub("[^%w_%.%-]", function(char) return string.format("~%02X", char:byte()) end)
+end
+
+local function decode(value)
+    return value:gsub("~(%x%x)", function(hex) return string.char(tonumber(hex, 16)) end)
+end
+
+local function fields(value, delimiter)
+    local result, start = {}, 1
+    while true do
+        local at = value:find(delimiter, start, true)
+        result[#result + 1] = value:sub(start, at and at - 1 or #value)
+        if not at then return result end
+        start = at + #delimiter
+    end
+end
+
+local function native_parameters(value)
+    -- Match xrCore::_GetItemCount/_GetItem, including empty parentheses,
+    -- trimming, omitted trailing empties and the consecutive-separator stop.
+    if value == "" then return {} end
+    local count, start, last = 0, 1, 1
+    while true do
+        local at = value:find(":", start, true)
+        if not at then break end
+        start, last, count = at + 1, at + 1, count + 1
+        if value:sub(start, start) == ":" then break end
+    end
+    if last <= #value then count = count + 1 end
+    local parts, result = fields(value, ":"), {}
+    for i = 1, count do result[i] = parts[i]:match("^[%z\1-\32]*(.-)[%z\1-\32]*$") end
+    return result
+end
+
+local function route_handler(id, script)
+    local payload
+    if script and script ~= "" then
+        local open, close = script:find("(", 1, true), script:find(")", 1, true)
+        local functor = open and close and open < close and script:sub(1, open - 1) or nil
+        local parameters = functor and script:sub(open + 1, close - 1) or nil
+        if parameters ~= nil then
+            payload = "P" .. encode(functor)
+            for _, value in ipairs(native_parameters(parameters)) do payload = payload .. "|" .. encode(value) end
+        else payload = "F" .. encode(script) end
+    else payload = "S" .. encode(id) end
+    local chunks = {}
+    for i = 1, #payload, 60 do chunks[#chunks + 1] = payload:sub(i, i + 59) end
+    local handler = "gcs_dialogue.phrase(" .. table.concat(chunks, ":") .. ")"
+    -- Native DIALOG_UPGRADE uses string256 for the handler and string64 per
+    -- colon-delimited argument. Preserve an oversized third-party handler.
+    if #handler >= 256 then return nil end
+    return handler
+end
+
+-- Script-built dialogs (CPhraseDialog:AddPhrase from an init_func) keep a
+-- static text ID that UITalkWnd translates natively (UITalkWnd.cpp:320/333).
+-- The same self-contained S route as XML phrases, set as the phrase's script
+-- text, lets the current profile choose the text when the phrase is shown.
+function static_route(id)
+    if type(id) ~= "string" or id == "" or not known_text(id) then return nil end
+    return route_handler(id, nil)
+end
+
+-- DIALOG_UPGRADE wrapper has the exact engine's six-argument parameter form.
+-- Existing ordinary three-argument or parameterized six-argument script_text
+-- functors retain their original call convention and authored parameters.
+function phrase(first, second, dialog_id, phrase_id, unused, parameters)
+    local payload = parameters and table.concat(parameters, "") or ""
+    local kind, values = payload:sub(1, 1), fields(payload:sub(2), "|")
+    if kind ~= "S" and kind ~= "F" and kind ~= "P" then
+        printf("[GCS] Invalid native dialogue route in %s/%s", tostring(dialog_id), tostring(phrase_id))
+        return ""
+    end
+    for i, value in ipairs(values) do values[i] = decode(value) end
+    local speaker = first
+    if first and db.actor and first:id() == db.actor:id() then speaker = second end
+    local id = kind == "S" and values[1] or ""
+    if kind ~= "S" then
+        local func = resolve_functor(values[1])
+        if not func then
+            printf("[GCS] Missing original script_text: %s", values[1])
+            return id
+        end
+        if kind == "P" then
+            table.remove(values, 1)
+            id = func(first, second, dialog_id, phrase_id, "", values)
+        else
+            id = func(speaker, dialog_id, phrase_id)
+        end
+    end
+    return native_id(id, speaker)
+end
+
+local function xml_escape(value)
+    return tostring(value):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;")
+end
+
+-- Every file in system [dialogs] (for example GAMMA's AH_dialogs.xml), plus
+-- the historical gameplay\dialogs*.xml names. The list is read once.
+local function dialog_file(file)
+    if file:match("^gameplay\\dialogs[^\\]*%.xml$") then return true end
+    if not dialog_files then
+        local ok, list = pcall(function() return system_ini():r_string_ex("dialogs", "files") end)
+        if not ok or type(list) ~= "string" then return false end
+        dialog_files = {}
+        for name in list:gmatch("[^,]+") do
+            name = name:match("^%s*(.-)%s*$"):lower():gsub("/", "\\")
+            if name ~= "" then dialog_files["gameplay\\" .. name .. ".xml"] = true end
+        end
+    end
+    return dialog_files[file] == true
+end
+
+local function xml_text(xml, node)
+    -- Empty dialogue text/script_text elements are legal. DXML getText warns
+    -- unless the public DOM contains exactly one text child.
+    if node and node.kids and #node.kids == 1 and xml:isText(node.kids[1]) then
+        return xml:getText(node)
+    end
+end
+
+function on_xml(filename, xml, flags)
+    local file = filename:lower():gsub("/", "\\")
+    local lang = file:match("^text\\([^\\]+)\\")
+    if lang then
+        -- Only the selector's own empty namespace file is extended. Existing
+        -- shared native strings retain their original GAMMA/LASS values.
+        if not file:match("\\st_gcs_runtime%.xml$") then return end
+        install()
+        prepare_catalog()
+        if not catalog[lang] then return end
+        if flags then flags.cache = false end
+        loaded_aliases[lang] = {}
+        local existing = {}
+        for _, row in ipairs(xml:query("string")) do existing[xml:getElementAttr(row).id] = true end
+        for id, value in pairs(catalog[lang]) do
+            if not existing[id] then
+                xml:insertFromXMLString('<string id="' .. xml_escape(id) .. '"><text>' .. xml_escape(value) .. '</text></string>')
+            end
+            loaded_aliases[lang][id] = true
+        end
+        return
+    end
+    if not dialog_file(file) then return end
+    local changed = false
+    for _, dialog in ipairs(xml:query("dialog")) do
+        local dialog_id = xml:getElementAttr(dialog).id
+        for _, node in ipairs(xml:query("phrase", dialog)) do
+            local phrase_id = xml:getElementAttr(node).id
+            local text_nodes, scripts = xml:query("text", node), xml:query("script_text", node)
+            local id = xml_text(xml, text_nodes[1]) or ""
+            local script = xml_text(xml, scripts[1])
+            if (script and script:find("^gcs_dialogue%.phrase")) then
+                -- This object can be passed through DXML more than once.
+            elseif known_text(id) or (script and script ~= "") then
+                local handler = route_handler(id, script)
+                if handler then
+                    local target = scripts[1]
+                    if not target then target = xml:insertElement({name = "script_text"}, node) end
+                    xml:setText(target, handler)
+                    changed = true
+                else
+                    printf("[GCS] Original dialogue handler retained: encoded route exceeds native limit in %s/%s", tostring(dialog_id), tostring(phrase_id))
+                end
+            end
+        end
+    end
+    if changed and flags then flags.cache = false end
+end
+
+function refresh_safe()
+    if not dirty or refreshing then return true end
+    if not (db and db.actor and level and level.present()) then return false end
+    if gcs_identity and gcs_identity.pending_error() then return false end
+    refreshing = true
+    local ok, why = pcall(function()
+        if gcs_dialogue_cache then gcs_dialogue_cache.refresh() end
+        if gcs_npc_audio and gcs_npc_audio.refresh then gcs_npc_audio.refresh() end
+    end)
+    refreshing = false
+    if not ok then
+        printf("[GCS] Owned dialogue refresh failed: %s", tostring(why))
+        return false
+    end
+    dirty = false
+    return true
+end
+
+-- gcs_identity.notify owns loading-completion and masked-possession refresh.

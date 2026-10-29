@@ -1,0 +1,69 @@
+-- Change only BHS atlas references in UI instances, never the shared atlas IDs.
+local DESCRIPTOR = "ui\\textures_descr\\ui_gcs_health.xml"
+
+-- A health profile that names only its atlas gets texture IDs derived from the
+-- stock BHS IDs (gcs_presentation.health_textures). Create those IDs on the
+-- pack's own atlas with the stock layout this descriptor keeps as template
+-- IDs (LAYOUT_PREFIX .. stock ID). Male maps the stock IDs to themselves, so
+-- GAMMA's own ui_hud.xml lays out its textures; it uses no template ID.
+local LAYOUT_PREFIX = "gcs_bhs_layout_"
+local function attribute(value) return tostring(value):gsub('[&<>"]', "") end
+
+local function add_atlas_descriptors(xml)
+    local base = gcs_builtin_presentation and gcs_builtin_presentation.get("gamma_male_health")
+    if not (base and base.textures and gcs_registry and gcs_registry.list_profiles and gcs_presentation) then return end
+    -- Decide by texture ID, not by file: the templates sit on the stock
+    -- atlas, which an atlas-only pack profile may also name.
+    local stock_of, layout, defined = {}, {}, {}
+    for stock in pairs(base.textures) do stock_of[LAYOUT_PREFIX .. stock] = stock end
+    for _, file in ipairs(xml:query("file")) do
+        for _, texture in ipairs(xml:query("texture", file)) do
+            local attr = xml:getElementAttr(texture)
+            if attr.id then defined[attr.id] = true end
+            local stock = stock_of[attr.id]
+            if stock then layout[stock] = attr end
+        end
+    end
+    for _, profile in ipairs(gcs_registry.list_profiles("health")) do
+        if type(profile.atlas) == "string" and profile.textures == nil then
+            local rows = {}
+            local mapping = gcs_presentation.health_textures(profile)
+            local stocks = {}
+            for stock in pairs(mapping) do stocks[#stocks + 1] = stock end
+            table.sort(stocks)
+            for _, stock in ipairs(stocks) do
+                local rect = layout[stock]
+                if rect and not defined[mapping[stock]] then
+                    defined[mapping[stock]] = true
+                    rows[#rows + 1] = '<texture id="' .. attribute(mapping[stock]) .. '" x="' .. attribute(rect.x) .. '" y="' .. attribute(rect.y)
+                        .. '" width="' .. attribute(rect.width) .. '" height="' .. attribute(rect.height) .. '" />'
+                end
+            end
+            if #rows > 0 then
+                xml:insertFromXMLString('<file name="' .. attribute(profile.atlas) .. '">' .. table.concat(rows) .. '</file>')
+            end
+        end
+    end
+end
+
+function on_xml_read()
+    RegisterScriptCallback("on_xml_read", function(filename, xml, flags)
+        local path = filename:lower():gsub("/", "\\")
+        if path == DESCRIPTOR then
+            add_atlas_descriptors(xml)
+            return
+        end
+        if not path:match("ui\\ui_body_health[^\\]*%.xml$")
+            and not path:match("ui\\ui_custom_msgs[^\\]*%.xml$") then return end
+        flags.cache = false
+        for _, element in ipairs(xml:query("texture")) do
+            -- Empty texture elements are legal. DXML getText logs an error for
+            -- them (or mixed/element children), so inspect its public DOM first.
+            if element.kids and #element.kids == 1 and xml:isText(element.kids[1]) then
+                local id = xml:getText(element)
+                local selected = gcs_presentation.texture(id)
+                if selected ~= id then xml:setText(element, selected) end
+            end
+        end
+    end)
+end

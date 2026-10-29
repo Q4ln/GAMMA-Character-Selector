@@ -1,0 +1,37 @@
+; Character Selector - editable name and dialogue profiles.
+; Gender definitions select these IDs in 10_genders.ltx.
+; Editing contents at an existing ID also affects saves using that profile.
+; For new-character-only changes, add a new unique profile ID in your pack.
+; Names use installed name subsets. literal_name requires a localized key.
+; The game removes every space from a value, so no value may need one.
+; text_source references authored dialogue; a label cannot generate grammar.
+; gcs_female_names uses GAMMA's own woman name sets. gcs_female_dialogue and
+; its Female text are registered by the LASS GAMMA Rebase's pack.
+; Guide: the Options section of GAMMA Character Selector - README.md.
+; Restart after edits. The catalog generator preserves this file once created.
+
+[gcs_profile_male_names]
+kind = profile
+id = gcs_male_names
+type = names
+revision = 1
+requires = gcs
+default_subsets = stalker, bandit, science
+military_subsets = private, sergeant, senior_sergeant, lieutenant, captain
+
+[gcs_profile_male_dialogue]
+kind = profile
+id = gcs_male_dialogue
+type = dialogue
+revision = 1
+requires = gcs
+text_source = gcs_male
+
+[gcs_profile_female_names]
+kind = profile
+id = gcs_female_names
+type = names
+revision = 1
+requires = gcs
+default_subsets = woman
+military_subsets = private_woman, sergeant_woman, senior_sergeant_woman, lieutenant_woman, captain_woman

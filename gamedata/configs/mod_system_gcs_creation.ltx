@@ -1,0 +1,5 @@
+; Process-only new-game transport. Lua owns these keys in memory and never saves
+; system.ltx. A new process starts empty; a saved-game load discards pending data.
+[gcs_creation_transport]
+pending =
+serial = 0

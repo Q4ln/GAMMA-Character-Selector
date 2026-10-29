@@ -1,0 +1,129 @@
+-- Profile text on surfaces the engine draws through CStringTable itself,
+-- without game.translate_string. Each hook hands the engine the current
+-- profile's preloaded alias (gcs_dialogue.display_id) only where that alias
+-- draws a different native string, so unmanaged games and profiles carrying
+-- GAMMA's own wording keep GAMMA's IDs and text exactly.
+--
+--  * Close captions: closecaption.cc_display_normal calls SetTextST(cc_id).
+--  * Script-built dialogs: add_dialog passes a static text ID to
+--    CPhraseDialog:AddPhrase, which UITalkWnd translates natively.
+--  * Item descriptions: CInventoryItem::Load translates "description"
+--    natively and the item box passes it through ui_item.item_description.
+--  * PDA achievements: CUIRankingWnd reads name/desc/hint from settings when
+--    the HUD loads, which is after the load-time identity selection.
+--
+-- axr_main loads every module before it runs any on_game_start, so the
+-- wrapped functions exist when this module installs.
+local hooked = {}
+local BUILDERS = {"dialog_manager", "dialogs_axr_companion", "ka_dialog", "txr_routes"}
+local ACHIEVEMENT_KEYS = {"name", "desc", "hint"}
+
+local function module(name)
+    local ok, value = pcall(function() return _G[name] end)
+    return ok and type(value) == "table" and value or nil
+end
+
+local function selected()
+    return gcs_dialogue and gcs_dialogue.profile and gcs_dialogue.profile() ~= nil
+end
+
+local function hook(owner, field, make)
+    local original = owner and owner[field]
+    if type(original) ~= "function" or hooked[original] then return false end
+    local wrapper = make(original)
+    hooked[wrapper] = true
+    owner[field] = wrapper
+    return true
+end
+
+-- A builder's add_dialog returns the phrase's script helper. A static text
+-- known to any dialogue profile gets the self-contained phrase route; the
+-- route resolves per phrase display, so it is gender independent and safe in
+-- the process-lifetime dialog data. A later SetScriptText by the caller
+-- (add_script_dialog) still replaces it.
+local function route_builder(original)
+    return function(p_id, id, phrase_id, ...)
+        local script = original(p_id, id, phrase_id, ...)
+        if script and gcs_dialogue and gcs_dialogue.static_route then
+            local handler = gcs_dialogue.static_route(phrase_id)
+            if handler then script:SetScriptText(handler) end
+        end
+        return script
+    end
+end
+
+local function described(obj)
+    if not selected() or not obj then return nil end
+    local ini, section = system_ini(), obj:section()
+    if not (section and ini:section_exist(section) and ini:line_exist(section, "description")) then return nil end
+    local id = ini:r_string(section, "description")
+    local routed = gcs_dialogue.display_id(id)
+    if routed == id then return nil end
+    return game.translate_string(routed)
+end
+
+function install()
+    for _, name in ipairs(BUILDERS) do
+        hook(module(name), "add_dialog", route_builder)
+    end
+    hook(module("closecaption"), "cc_display_normal", function(original)
+        return function(cc_id, ...)
+            return original(gcs_dialogue and gcs_dialogue.display_id and gcs_dialogue.display_id(cc_id) or cc_id, ...)
+        end
+    end)
+    hook(module("ui_item"), "item_description", function(original)
+        return function(obj, str, ...)
+            local ok, text = pcall(described, obj)
+            if ok and text then str = text end
+            return original(obj, str, ...)
+        end
+    end)
+end
+
+-- Settings outlive every Lua state, so this is stateless: each value is mapped
+-- back to its shared ID and rewritten to what the current profile shows.
+local function achievement_writes(ini)
+    local writes = {}
+    if not ini:section_exist("achievements") then return writes end
+    for index = 0, ini:line_count("achievements") - 1 do
+        local _, section = ini:r_line("achievements", index, "", "")
+        if type(section) == "string" and section ~= "" and ini:section_exist(section) then
+            for _, key in ipairs(ACHIEVEMENT_KEYS) do
+                if ini:line_exist(section, key) then
+                    local value = ini:r_string(section, key)
+                    if type(value) == "string" and value ~= "" then
+                        local wanted = gcs_dialogue.display_id(gcs_dialogue.source_id(value))
+                        if wanted ~= value then writes[#writes + 1] = {section, key, wanted} end
+                    end
+                end
+            end
+        end
+    end
+    return writes
+end
+
+function reconcile()
+    if not (gcs_dialogue and gcs_dialogue.display_id and gcs_dialogue.source_id) then return true end
+    local ini = system_ini()
+    local found, writes = pcall(achievement_writes, ini)
+    if not found then
+        printf("[GCS] Native text settings scan failed: %s", tostring(writes))
+        return false
+    end
+    if #writes == 0 then return true end
+    ini:save_at_end(false)
+    ini:set_override_names(true)
+    ini:set_readonly(false)
+    local ok, why = pcall(function()
+        for _, row in ipairs(writes) do ini:w_string(row[1], row[2], row[3]) end
+    end)
+    ini:set_readonly(true)
+    ini:set_override_names(false)
+    if not ok then printf("[GCS] Native text settings write failed: %s", tostring(why)) end
+    return ok
+end
+
+function on_game_start()
+    install()
+    reconcile()
+end

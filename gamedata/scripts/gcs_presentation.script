@@ -1,0 +1,916 @@
+-- Targeted, reversible in-memory presentation. Call apply before actor creation.
+-- No source INI, LASS script, executable, or user settings are written.
+local active, captured, allowlist = nil, {}, nil
+-- Effective sound routes of the active presentation, by profile type.
+local active_routes = {}
+local scoped, selector_wrappers = setmetatable({}, {__mode = "k"}), {}
+local callback_added = false
+local health_hook, health_xml_signature
+local health_handles = setmetatable({}, {__mode = "k"})
+
+local function snapshot(value)
+    if type(value) ~= "table" then return value end
+    local result = {}
+    for key, item in pairs(value) do result[key] = snapshot(item) end
+    return result
+end
+
+local function same_values(a, b)
+    if a == b then return true end
+    if type(a) ~= "table" or type(b) ~= "table" then return false end
+    for key, value in pairs(a) do if not same_values(value, b[key]) then return false end end
+    for key in pairs(b) do if a[key] == nil then return false end end
+    return true
+end
+
+local function canonical(path)
+    return tostring(path or ""):lower():gsub("/", "\\"):gsub("%.ogg$", "")
+end
+
+local function id(row) return row.section .. "\t" .. row.key end
+
+-- Observers register for gcs_presentation_changed in their on_game_start.
+-- axr_main loads every module before it runs any on_game_start, so adding the
+-- callback when this module loads makes it exist in every session, including
+-- one that only loads a save (notify, which fires it, never runs there).
+local function add_changed_callback()
+    if callback_added or type(AddScriptCallback) ~= "function" then return end
+    AddScriptCallback("gcs_presentation_changed")
+    callback_added = true
+end
+add_changed_callback()
+
+-- The true stock value of every owned key is recorded once per process, in
+-- the engine's own settings, before GCS first writes that key. pSettings
+-- outlives every Lua reset (a new game, every load, a level change) and this
+-- module's state does not, so a value read back in a later Lua state may be
+-- another gender's. Every restore uses this record, never such a value.
+-- Names and values are hex: CInifile::w_string strips whitespace outside
+-- quotes and stores an empty value as none. Its input buffer is a string4096,
+-- so a long value is split into chunks, its main entry written last. Adding
+-- these lines relies on the same compiled-away THROW3 as an addable key.
+local STOCK_RECORD = "gcs_presentation_stock"
+local RECORD_CHUNK = 3000
+local record_loaded, unrecorded = false, {}
+
+local function hex(value)
+    return (value:gsub(".", function(char) return string.format("%02X", char:byte()) end))
+end
+
+local function unhex(value)
+    if type(value) ~= "string" or #value % 2 ~= 0 or value:find("[^%x]") then return nil end
+    return (value:gsub("%x%x", function(pair) return string.char(tonumber(pair, 16)) end))
+end
+
+-- Reads every recorded key into captured, once per Lua state, before this
+-- state captures anything itself.
+local function load_record()
+    if record_loaded then return true end
+    local ini = system_ini()
+    if ini:section_exist(STOCK_RECORD) then
+        local names = {}
+        for index = 0, ini:line_count(STOCK_RECORD) - 1 do
+            local _, name = ini:r_line(STOCK_RECORD, index, "", "")
+            if type(name) == "string" and name:match("^k%x+$") then names[#names + 1] = name end
+        end
+        local found = {}
+        for _, name in ipairs(names) do
+            local key = unhex(name:sub(2))
+            local section, entry = (key or ""):match("^([^\t]+)\t(.+)$")
+            local payload = ini:r_string(STOCK_RECORD, name) or ""
+            local chunks = tonumber(payload:match("^C(%d+)$"))
+            if chunks then
+                local parts = {}
+                for n = 1, chunks do
+                    local part = name .. "_" .. n
+                    parts[n] = ini:line_exist(STOCK_RECORD, part) and ini:r_string(STOCK_RECORD, part) or ""
+                end
+                payload = table.concat(parts)
+            end
+            local value = payload:sub(1, 1) == "V" and unhex(payload:sub(2))
+            if not section or (payload ~= "A" and not value) then
+                return false, "Damaged presentation stock record: " .. tostring(key or name)
+            end
+            found[key] = payload == "A" and {section = section, key = entry, absent = true}
+                or {section = section, key = entry, value = value}
+        end
+        for key, row in pairs(found) do captured[key] = row end
+    end
+    record_loaded = true
+    return true
+end
+
+local function flush_record()
+    if #unrecorded == 0 then return true end
+    local ini = system_ini()
+    ini:save_at_end(false)
+    ini:set_override_names(true)
+    ini:set_readonly(false)
+    local ok, why = pcall(function()
+        for _, key in ipairs(unrecorded) do
+            local row, name = captured[key], "k" .. hex(key)
+            local payload = row.absent and "A" or "V" .. hex(row.value)
+            if #payload <= RECORD_CHUNK then
+                ini:w_string(STOCK_RECORD, name, payload)
+            else
+                local chunks = math.ceil(#payload / RECORD_CHUNK)
+                for n = 1, chunks do
+                    ini:w_string(STOCK_RECORD, name .. "_" .. n, payload:sub((n - 1) * RECORD_CHUNK + 1, n * RECORD_CHUNK))
+                end
+                ini:w_string(STOCK_RECORD, name, "C" .. chunks)
+            end
+        end
+    end)
+    ini:set_readonly(true)
+    ini:set_override_names(false)
+    if not ok then return false, "Presentation stock record write failed: " .. tostring(why) end
+    unrecorded = {}
+    return true
+end
+
+-- The write allowlist is an explicit generated table, independent of which
+-- built-in genders exist, so a pack shipped by another mod is held to the
+-- same section/key rules. "addable" keys may be absent from stock: a profile
+-- adds them and baseline removes them again.
+local function allowed()
+    if not allowlist then
+        allowlist = {}
+        for key, entry in pairs(gcs_builtin_presentation.write_keys()) do
+            allowlist[key] = {type = entry.type, addable = entry.addable == true}
+        end
+    end
+    return allowlist
+end
+
+local function addable(row)
+    local entry = allowed()[id(row)]
+    return entry ~= nil and entry.addable
+end
+
+local function permitted(profile, row)
+    if type(row) ~= "table" or type(row.section) ~= "string" or type(row.key) ~= "string"
+        or type(row.value) ~= "string" or row.value:find("[\r\n]") then return false end
+    local entry = allowed()[id(row)]
+    if entry and entry.type == profile.type then return true end
+    -- A provider can add private HUD sections without widening the gameplay
+    -- key allowlist. The section/key must already exist in mounted pSettings.
+    return profile.type == "body" and row.section:match("^gcs_[a-z0-9_]+$")
+        and (row.key == "visual" or row.key == "visual_2")
+end
+
+local model_keys = {visual = true, visual_2 = true, actor_visual = true, legs_visual = true, item_visual = true}
+local voice_sources = {actor_effects=true, agdd_voiced_actor=true, grok_doom_weapons_inspect=true,
+    grok_progressive_rad_damages=true, zzz_player_injuries=true, zzz_lass_varefined_adapter=true}
+local player_sources = {liz_fdda_redone_consumables=true}
+-- Modules that capture xr_sound.get_safe_sound_object in a local at load.
+local safe_sound_modules = {"perk_based_artefacts", "momopate_pba_tweaks", "gunslinger_controller", "drx_da_main",
+    "weapon_cover_tilt_rattle"}
+
+-- A health profile may name only its atlas. Its texture IDs are then derived
+-- from the stock BHS IDs and created at XML read time (modxml_gcs_health).
+function health_textures(profile)
+    if type(profile) ~= "table" then return {} end
+    if type(profile.textures) == "table" then return profile.textures end
+    local result = {}
+    local base = gcs_builtin_presentation.get("gamma_male_health")
+    local prefix = "gcs_atlas_" .. tostring(profile.id or "health"):gsub("[^%w_]", "_") .. "_"
+    for stock in pairs(base and base.textures or {}) do result[stock] = prefix .. stock end
+    return result
+end
+local function resource(kind, path, extension)
+    if type(path) ~= "string" or path == "" then return false end
+    if extension and path:sub(-#extension):lower() ~= extension then path = path .. extension end
+    return gcs_registry.resource_exists(kind, path)
+end
+
+-- A pack may mark routes optional (optional_sound_routes), for files shipped
+-- by an optional component. One whose target is not installed is skipped and
+-- the stock sound plays; a required route to a missing file still rejects the
+-- whole profile.
+local function routes_of(profile)
+    local result = {}
+    if type(profile) ~= "table" then return result end
+    if type(profile.optional_sound_routes) == "table" then
+        for from, to in pairs(profile.optional_sound_routes) do
+            if type(from) == "string" and resource("sounds", to, ".ogg") then result[from] = to end
+        end
+    end
+    if type(profile.sound_routes) == "table" then
+        for from, to in pairs(profile.sound_routes) do result[from] = to end
+    end
+    return result
+end
+
+function sound_routes(profile) return routes_of(profile) end
+
+local function activate(value)
+    active, active_routes = value, {}
+    for typ, profile in pairs(value and value.profiles or {}) do active_routes[typ] = routes_of(profile) end
+end
+
+-- A profile the Selector itself defines (gamma_male_*): its values are never
+-- written. Packs register other IDs; a duplicate ID never resolves.
+local function is_builtin(profile)
+    return type(profile) == "table" and profile.id ~= nil and gcs_builtin_presentation.get(profile.id) ~= nil
+end
+
+-- Each dropped built-in row is logged once per Lua state.
+local dropped_rows = {}
+local function drop_row(profile, row)
+    local key = tostring(profile.id) .. "/" .. id(row)
+    if dropped_rows[key] then return end
+    dropped_rows[key] = true
+    if printf then
+        printf("[GCS] %s: %s/%s is not in the running game; that row is dropped", tostring(profile.id), row.section, row.key)
+    end
+end
+
+function validate_profile(profile)
+    if profile.type == "names" or profile.type == "dialogue" then return true end
+    if profile.type ~= "body" and profile.type ~= "voice" and profile.type ~= "movement" and profile.type ~= "health" then
+        return false, "Unsupported presentation profile type: " .. tostring(profile.type)
+    end
+    if profile.values ~= nil and type(profile.values) ~= "table" then return false, "Presentation values must be an array" end
+    if profile.sound_routes ~= nil and type(profile.sound_routes) ~= "table" then return false, "Sound routes must be a mapping" end
+    if profile.optional_sound_routes ~= nil and type(profile.optional_sound_routes) ~= "table" then
+        return false, "Optional sound routes must be a mapping"
+    end
+    local row_count = 0
+    for key in pairs(profile.values or {}) do
+        if type(key) ~= "number" or key < 1 or key ~= math.floor(key) then return false, "Presentation values must use consecutive numeric indexes" end
+        row_count = row_count + 1
+    end
+    if row_count ~= #(profile.values or {}) then return false, "Presentation values contain a missing row" end
+    -- A built-in profile (Male) is GAMMA's stock. prepare never writes its
+    -- rows' values, only the running game's stock record, so they are checked
+    -- only for what is used: a section or key the running game lacks drops
+    -- that row (prepare skips it), and no value check applies.
+    local builtin = is_builtin(profile)
+    local seen, ini = {}, system_ini()
+    for _, row in ipairs(profile.values or {}) do
+        if not permitted(profile, row) then return false, "Presentation key is not allowed: " .. tostring(row.section) .. "/" .. tostring(row.key) end
+        if seen[id(row)] then return false, "Duplicate presentation key: " .. id(row) end
+        seen[id(row)] = true
+        if not ini:section_exist(row.section) or (not ini:line_exist(row.section, row.key) and not addable(row)) then
+            if not builtin then return false, "Missing presentation INI key: " .. row.section .. "/" .. row.key end
+            drop_row(profile, row)
+        elseif builtin then -- its value is never written: nothing to check
+        elseif model_keys[row.key] and not resource("meshes", row.value, ".ogf") then
+            return false, "Missing presentation model: " .. row.value
+        elseif (row.key == "player_hud_section" or row.key == "hud") and not ini:section_exist(row.value) then
+            return false, "Missing HUD section: " .. row.value
+        elseif profile.type == "voice" or row.key:match("^snd_") or row.key:match("^scripted_snd_") then
+            for path in row.value:gmatch("[^,]+") do
+                path = path:match("^%s*(.-)%s*$")
+                if path ~= "" and path ~= "none" and not tonumber(path) and not resource("sounds", path, ".ogg") then
+                    return false, "Missing presentation sound: " .. path
+                end
+            end
+        end
+    end
+    -- Male's no-outfit body is the engine's (server_visual), not this value.
+    if profile.type == "body" and not builtin and not resource("meshes", profile.server_visual, ".ogf") then
+        return false, "Missing no-outfit server model: " .. tostring(profile.server_visual)
+    end
+    if profile.type == "voice" and profile.selector ~= "gamma" and profile.selector ~= "lass" then
+        return false, "Voice selector must be gamma or lass"
+    end
+    for from, to in pairs(profile.sound_routes or {}) do
+        if type(from) ~= "string" or not resource("sounds", to, ".ogg") then return false, "Invalid sound route: " .. tostring(from) end
+    end
+    -- An optional target may be absent; its shape is still checked.
+    for from, to in pairs(profile.optional_sound_routes or {}) do
+        if type(from) ~= "string" or from == "" or type(to) ~= "string" or to == ""
+            or to:find("..", 1, true) or to:find(":", 1, true) or to:find("[%c,]") then
+            return false, "Invalid optional sound route: " .. tostring(from)
+        end
+        if profile.sound_routes and profile.sound_routes[from] ~= nil then
+            return false, "Sound route is both required and optional: " .. from
+        end
+    end
+    if profile.type == "health" then
+        -- Male maps GAMMA's own BHS texture IDs to themselves and uses no atlas.
+        if (profile.textures ~= nil and type(profile.textures) ~= "table")
+            or not builtin and (not profile.atlas or not resource("textures", profile.atlas, ".dds")) then
+            return false, "Health profile requires texture IDs and an existing atlas"
+        end
+        if type(profile.atlas) == "string" and profile.atlas:find('[%c"<>&]') then return false, "Invalid health atlas path" end
+        for from, to in pairs(health_textures(profile)) do
+            if type(from) ~= "string" or type(to) ~= "string" or from == "" or to == "" then return false, "Invalid health texture mapping" end
+        end
+        if profile.windows ~= nil and type(profile.windows) ~= "table" then return false, "Health windows must be a mapping" end
+        for name, texture_id in pairs(profile.windows or {}) do
+            if type(name) ~= "string" or type(texture_id) ~= "string" then return false, "Invalid health window mapping" end
+        end
+    end
+    return true
+end
+
+-- An addable key that stock lacks is captured as absent; restoring that
+-- baseline removes the line instead of writing a value. A key the process
+-- record does not hold yet has never been written by GCS in this process, so
+-- its current value is stock; prepare records it before anything is written.
+local function capture(row)
+    local key = id(row)
+    if captured[key] == nil then
+        local ini = system_ini()
+        if ini:line_exist(row.section, row.key) then
+            captured[key] = {section = row.section, key = row.key, value = ini:r_string(row.section, row.key) or ""}
+        elseif addable(row) and ini:section_exist(row.section) then
+            captured[key] = {section = row.section, key = row.key, absent = true}
+        else
+            return false, "Missing INI key: " .. key
+        end
+        unrecorded[#unrecorded + 1] = key
+    end
+    return true
+end
+
+local function current_row(ini, row)
+    if ini:line_exist(row.section, row.key) then
+        return {section = row.section, key = row.key, value = ini:r_string(row.section, row.key) or ""}
+    end
+    return {section = row.section, key = row.key, absent = true}
+end
+
+-- The engine plays an item's use_sound itself: CActorCondition::ApplyInfluence
+-- and ApplyBooster read it from pSettings at each use. That is the item-use
+-- path whenever FDDA plays no animation for the item (FDDA off, or vanilla
+-- animations), so a player route (voice, then movement) is applied there too,
+-- as an in-memory write. Only use_sound keys whose stock value is a routed path
+-- change, and the baseline restores them like every other row. Routes are live
+-- Lua state, so these derived rows stay out of the reload signature.
+local use_sound_sections
+local function route_use_sounds(gender, ini, rows)
+    local voice, movement = routes_of(gender.profiles.voice), routes_of(gender.profiles.movement)
+    if next(voice) == nil and next(movement) == nil then return true end
+    if not use_sound_sections then
+        if type(ini.section_for_each) ~= "function" then return true end
+        local found = {}
+        ini:section_for_each(function(section)
+            if ini:line_exist(section, "use_sound") then found[#found + 1] = section end
+        end)
+        table.sort(found)
+        use_sound_sections = found
+    end
+    for _, section in ipairs(use_sound_sections) do
+        local key = section .. "\tuse_sound"
+        local stock = captured[key] and captured[key].value
+        if stock == nil and ini:line_exist(section, "use_sound") then stock = ini:r_string(section, "use_sound") end
+        local path = canonical(tostring(stock or ""):match("^%s*(.-)%s*$"))
+        local target = path ~= "" and (voice[path] or movement[path])
+        -- An explicit profile row for the same key keeps precedence.
+        if target and not rows[key] then
+            local ok, why = capture({section = section, key = "use_sound"})
+            if not ok then return false, why end
+            captured[key].derived = true
+            rows[key] = {section = section, key = "use_sound", value = target, derived = true}
+        end
+    end
+    return true
+end
+
+local function prepare(gender)
+    if type(gender) ~= "table" or type(gender.profiles) ~= "table" then return nil, "Resolved gender is required" end
+    local loaded, load_error = load_record()
+    if not loaded then return nil, load_error end
+    local rows = {}
+    for _, typ in ipairs({"body", "voice"}) do
+        local profile = gender.profiles[typ]
+        if not profile then return nil, "Missing " .. typ .. " profile" end
+        -- A built-in profile (Male) is GAMMA's stock. Its rows are the values
+        -- the generator read from one modpack definition; it writes the
+        -- running game's stock record instead, so a GAMMA update or another
+        -- mod that changes one of these keys leaves Male equal to stock.
+        -- A built-in row whose section or key the running game lacks is
+        -- dropped (validate_profile): there is no stock value to write.
+        local stock = is_builtin(profile)
+        for _, row in ipairs(profile.values or {}) do
+            if not permitted(profile, row) then return nil, "Presentation key is not allowed: " .. id(row) end
+            local ok, why = capture(row)
+            if ok then rows[id(row)] = stock and captured[id(row)] or row
+            elseif stock then drop_row(profile, row)
+            else return nil, why end
+        end
+    end
+    local routed, route_error = route_use_sounds(gender, system_ini(), rows)
+    if not routed then return nil, route_error end
+    -- Include every allowlisted key so switching to a partial custom profile
+    -- cannot leave another life's body/voice keys behind. A key that neither
+    -- exists nor may be added can never have been written, so it is skipped.
+    local ini = system_ini()
+    for key, entry in pairs(allowed()) do
+        if captured[key] == nil then
+            local section, name = key:match("^(.-)\t(.*)$")
+            local row = {section = section, key = name}
+            if ini:section_exist(section) and (ini:line_exist(section, name) or entry.addable) then
+                local ok, why = capture(row)
+                if not ok then return nil, why end
+            end
+        end
+    end
+    -- Every recorded key this gender does not write returns to stock, also a
+    -- key that only another gender, in an earlier Lua state, wrote.
+    for key, row in pairs(captured) do if not rows[key] then rows[key] = row end end
+    local recorded, record_error = flush_record()
+    if not recorded then return nil, record_error end
+    return rows
+end
+
+local function ordered(rows)
+    local keys = {}
+    for key in pairs(rows) do keys[#keys + 1] = key end
+    table.sort(keys)
+    return keys
+end
+
+function signature(gender)
+    local rows, why = prepare(gender)
+    if not rows then return nil, why end
+    local result = {"gcs-cache-v1"}
+    for _, typ in ipairs({"body", "voice"}) do
+        result[#result + 1] = typ .. ":" .. tostring(gender.profiles[typ].revision)
+    end
+    result[#result + 1] = "server_visual:" .. tostring(gender.profiles.body.server_visual)
+    local owned = allowed()
+    for _, key in ipairs(ordered(rows)) do
+        local value = rows[key].value
+        -- Length -1 marks a captured-absent key; real values use their length.
+        if rows[key].derived then -- routed use_sound: live, like the routes
+        -- A key outside the allowlist that this gender leaves at stock (another
+        -- gender's derived use_sound or private gcs_* key) is not part of this
+        -- gender's cache, and which of them are recorded depends on history.
+        elseif rows[key] == captured[key] and not owned[key] then
+        elseif rows[key].absent then result[#result + 1] = #key .. ":" .. key .. "-1:"
+        else result[#result + 1] = #key .. ":" .. key .. #value .. ":" .. value end
+    end
+    return table.concat(result, "\n")
+end
+
+local function write(rows)
+    local ini = system_ini()
+    ini:save_at_end(false)
+    ini:set_override_names(true)
+    ini:set_readonly(false)
+    local ok, why = pcall(function()
+        for _, key in ipairs(ordered(rows)) do
+            local row = rows[key]
+            local present = ini:line_exist(row.section, row.key)
+            if row.absent then
+                if present then ini:remove_line(row.section, row.key) end
+            elseif not present or (ini:r_string(row.section, row.key) or "") ~= row.value then
+                ini:w_string(row.section, row.key, row.value)
+            end
+        end
+    end)
+    ini:set_readonly(true)
+    ini:set_override_names(false)
+    return ok, why
+end
+
+function apply(gender)
+    local rows, why = prepare(gender)
+    if not rows then return false, why end
+    local previous, before = active, {}
+    local ini = system_ini()
+    for key, row in pairs(rows) do
+        before[key] = current_row(ini, row)
+    end
+    local ok, problem = write(rows)
+    if not ok then
+        local restored, restore_error = write(before)
+        return false, tostring(problem) .. (restored and "" or "; rollback failed: " .. tostring(restore_error))
+    end
+    -- The caller retains its definition; adapters own an independent snapshot.
+    activate(snapshot(gender))
+    local installed, install_error = pcall(install_adapters)
+    if not installed then
+        activate(previous)
+        local restored, restore_error = write(before)
+        return false, tostring(install_error) .. (restored and "" or "; rollback failed: " .. tostring(restore_error))
+    end
+    return true
+end
+
+-- Restores every key GCS has written in this process, from the process
+-- record: also in a new Lua state that has not applied anything yet.
+function baseline()
+    local loaded, load_error = load_record()
+    if not loaded then return false, load_error end
+    local ok, why = write(captured)
+    if ok then activate(nil) end
+    return ok, why
+end
+
+-- The engine's own no-outfit actor body, recorded once per process next to
+-- the stock record, so it outlives every Lua reset. A new game's actor packet
+-- holds it when its first server_entity_on_register runs: reading the spawn
+-- packet applied the live actor profile's <visual> (set_specific_character,
+-- xrServer_Objects_ALife_Monsters.cpp:444-452) and no gender has written the
+-- packet yet. A saved game's packet holds a saved value and is never recorded.
+local SERVER_VISUAL = "server_visual"
+
+local function recorded_server_visual()
+    local ini = system_ini()
+    if not ini:section_exist(STOCK_RECORD) or not ini:line_exist(STOCK_RECORD, SERVER_VISUAL) then return nil end
+    local payload = ini:r_string(STOCK_RECORD, SERVER_VISUAL) or ""
+    local value = payload:sub(1, 1) == "V" and unhex(payload:sub(2)) or nil
+    if value and value ~= "" then return value end
+end
+
+function record_server_visual(visual)
+    if recorded_server_visual() then return true end
+    if type(visual) ~= "string" or visual == "" or visual:find("%c") or #visual * 2 + 1 > RECORD_CHUNK then
+        return false, "Invalid engine actor visual: " .. tostring(visual)
+    end
+    local ini = system_ini()
+    ini:save_at_end(false)
+    ini:set_override_names(true)
+    ini:set_readonly(false)
+    local ok, why = pcall(function() ini:w_string(STOCK_RECORD, SERVER_VISUAL, "V" .. hex(visual)) end)
+    ini:set_readonly(true)
+    ini:set_override_names(false)
+    if not ok then return false, "Engine actor visual record write failed: " .. tostring(why) end
+    return true
+end
+
+-- GAMMA's no-outfit body: the engine's recorded body, else the generator's
+-- (before any new game of this process has recorded one).
+function stock_server_visual()
+    local recorded = recorded_server_visual()
+    if recorded then return recorded end
+    local body = gcs_builtin_presentation.get("gamma_male_body")
+    return body and body.server_visual
+end
+
+local function visual_key(value)
+    return tostring(value or ""):lower():gsub("/", "\\"):gsub("%.ogf$", "")
+end
+
+-- A registered pack gender's no-outfit body.
+local function pack_body(visual)
+    if type(gcs_registry.list_profiles) ~= "function" then return false end
+    for _, profile in ipairs((gcs_registry.list_profiles("body"))) do
+        if gcs_builtin_presentation.get(profile.id) == nil and visual_key(profile.server_visual) == visual_key(visual) then
+            return true
+        end
+    end
+    return false
+end
+
+-- The no-outfit body to write into the actor packet that holds current, or
+-- nil to leave the packet as it is. A pack's body names its own model. A
+-- built-in body (Male) is GAMMA's: the packet keeps its body, as in an
+-- unmanaged game (a new game's is the engine's own), unless that body is a
+-- pack gender's or a model that is not installed. Only then is a body
+-- written: the engine's recorded body, or, before any new game of this
+-- process recorded it, the generator's, the one stock body known then.
+function server_visual(gender, current)
+    local body = gender and gender.profiles and gender.profiles.body
+    if type(body) ~= "table" then return nil end
+    if gcs_builtin_presentation.get(body.id) == nil then return body.server_visual end
+    if type(current) == "string" and current ~= "" and not pack_body(current) and resource("meshes", current, ".ogf") then
+        return nil
+    end
+    return stock_server_visual()
+end
+
+-- Inspection is infrequent; internal sound/HUD paths use the private active data.
+function current() return snapshot(active) end
+
+function route_sound(path, typ)
+    if not active then return path end
+    if typ == "player" then
+        -- Item-use, ledge-grab and artefact-perk sounds: voice routes first,
+        -- then movement routes. Only explicitly routed paths change. This is
+        -- also the global xr_sound hook, so an NPC voice key a pack routes
+        -- (the Rebase's help_* and death_4 byte copies) changes for every
+        -- caller while that gender is active. That is intended: the old Rebase
+        -- replaced those files for every speaker, and the pack's NPC bank
+        -- routes the engine's sound themes to the same files.
+        local key = canonical(path)
+        for _, kind in ipairs({"voice", "movement"}) do
+            local target = active_routes[kind] and active_routes[kind][key]
+            if target then return target end
+        end
+        return path
+    end
+    if not active.profiles[typ] then return path end
+    return (active_routes[typ] or {})[canonical(path)] or path
+end
+
+-- Each selected function gets its own forwarding environment. Only that
+-- function and its same-source helper closures see the constructor adapter;
+-- NPC sounds, other scripts, module state and event registrations are intact.
+local function scope_sound(fn, typ, source, visited)
+    if type(fn) ~= "function" or scoped[fn] then return end
+    local info = debug.getinfo(fn, "S")
+    if not info or info.what == "C" then return end
+    if source and info.source ~= source then
+        local name = info.source:lower():match("([^/\\]+)%.script$")
+        local sources = typ == "voice" and voice_sources or typ == "player" and player_sources or nil
+        if not sources or not sources[name] then return end
+    end
+    source, visited = source or info.source, visited or {}
+    if visited[fn] then return end
+    visited[fn] = true
+    local env = getfenv(fn)
+    local constructor = env.sound_object
+    if not constructor then return end
+    local sound_proxy = setmetatable({}, {
+        __call = function(_, path, ...) return constructor(route_sound(path, typ), ...) end,
+        __index = function(_, key) return constructor[key] end,
+    })
+    local proxy = setmetatable({}, {
+        __index = function(_, key) if key == "sound_object" then return sound_proxy end; return env[key] end,
+        __newindex = function(_, key, value) env[key] = value end,
+    })
+    setfenv(fn, proxy)
+    scoped[fn] = true
+    local n = 1
+    while true do
+        local name, value = debug.getupvalue(fn, n)
+        if not name then break end
+        if type(value) == "function" then scope_sound(value, typ, source, visited) end
+        n = n + 1
+    end
+end
+
+local function scope_module(module, names, typ)
+    if type(module) ~= "table" then return end
+    for _, name in ipairs(names) do scope_sound(module[name], typ) end
+end
+
+-- xr_sound caches sound objects by path. Route the path first so the cache
+-- key is the routed file: each gender gets its own correct cached object.
+-- Modules that captured the original function in a local at load time are
+-- retargeted through that upvalue (shared by all of the module's closures).
+local safe_sound_originals = setmetatable({}, {__mode = "k"})
+local function retarget_upvalues(fn, wrapper, visited, source)
+    if type(fn) ~= "function" or visited[fn] then return end
+    visited[fn] = true
+    local info = debug.getinfo(fn, "S")
+    if not info or info.what == "C" or (source and info.source ~= source) then return end
+    source = source or info.source
+    for n = 1, 200 do
+        local name, value = debug.getupvalue(fn, n)
+        if not name then break end
+        if type(value) == "function" then
+            if safe_sound_originals[value] then debug.setupvalue(fn, n, wrapper)
+            else retarget_upvalues(value, wrapper, visited, source) end
+        end
+    end
+end
+
+local function install_safe_sound_adapter()
+    local sounds = xr_sound
+    if type(sounds) ~= "table" or type(sounds.get_safe_sound_object) ~= "function" then return end
+    if selector_wrappers.safe_sound ~= sounds.get_safe_sound_object then
+        local original = sounds.get_safe_sound_object
+        safe_sound_originals[original] = true
+        local wrapper = function(path, ...) return original(route_sound(path, "player"), ...) end
+        sounds.get_safe_sound_object, selector_wrappers.safe_sound = wrapper, wrapper
+    end
+    for _, name in ipairs(safe_sound_modules) do
+        local module = rawget(_G, name)
+        if type(module) == "table" then
+            for _, fn in pairs(module) do retarget_upvalues(fn, selector_wrappers.safe_sound, {}) end
+        end
+    end
+end
+
+-- Only the LASS voice selector delegates to the functions the voice adapter
+-- installed. Every other game (a gamma voice profile, and a game with no
+-- gender, whose active presentation is nil) builds GAMMA's own path here, so
+-- it gets GAMMA's voice whether or not the adapter gates itself.
+local function lass_voice()
+    local voice = active and active.profiles.voice
+    return voice ~= nil and voice.selector == "lass"
+end
+
+-- Sound objects a module creates once, when it loads, and plays later from a
+-- module global. No hook sees their construction, so the global itself is
+-- set per gender: a routed object while a route applies, otherwise the
+-- module's own object.
+local load_time_sounds = {
+    {module = "grok_doom_weapons_inspect", field = "music", path = [[grok\grok_doom_inspect]], type = "voice"},
+}
+local load_time_originals, load_time_objects = {}, {}
+local load_time_created = setmetatable({}, {__mode = "k"})
+
+local function retarget_load_time_sounds()
+    for _, entry in ipairs(load_time_sounds) do
+        local module = _G[entry.module]
+        if type(module) == "table" then
+            local key = entry.module .. "." .. entry.field
+            local current = module[entry.field]
+            if current ~= nil and not load_time_created[current] then load_time_originals[key] = current end
+            local target = route_sound(entry.path, entry.type)
+            if target ~= entry.path then
+                local object = load_time_objects[target]
+                if object == nil then
+                    object = sound_object(target)
+                    load_time_objects[target] = object
+                    load_time_created[object] = true
+                end
+                module[entry.field] = object
+            elseif load_time_originals[key] ~= nil then
+                module[entry.field] = load_time_originals[key]
+            end
+        end
+    end
+end
+
+function install_adapters()
+    -- Loading the required LASS adapter installs its wrappers immediately.
+    local lass = zzz_lass_varefined_adapter
+    local va = agdd_voiced_actor
+    if va then
+        if selector_wrappers.random ~= va.random_voice_line then
+            local original = va.random_voice_line
+            local wrapper = function(category, subcategory, language_key, muffle_val, line)
+                if not lass_voice() then
+                    local count = va.get_lines_amount_for_line(line, language_key)
+                    if count == 0 then return nil end
+                    local path = string.format("characters_voice\\%s%s\\%s\\%s%s_%d", category,
+                        va.language_prefix(language_key), subcategory, muffle_val, line, va.get_shuffle(line, count))
+                    return route_sound(path, "voice")
+                end
+                return route_sound(original(category, subcategory, language_key, muffle_val, line), "voice")
+            end
+            va.random_voice_line, selector_wrappers.random = wrapper, wrapper
+        end
+        if selector_wrappers.shuffled ~= va.get_shuffled_line then
+            local original = va.get_shuffled_line
+            local wrapper = function(category, lines, format)
+                if not lass_voice() then
+                    local path = format:gsub("<l>", va.get_actor_lang() or ""):gsub("<m>", va.get_muffle_status() or "")
+                    path = path:gsub("<n>", tostring(va.get_shuffle(category, lines)))
+                    return route_sound(path, "voice")
+                end
+                return route_sound(original(category, lines, format), "voice")
+            end
+            va.get_shuffled_line, selector_wrappers.shuffled = wrapper, wrapper
+        end
+        if va.actor_speak_base and selector_wrappers.speak ~= va.actor_speak_base then
+            local original = va.actor_speak_base
+            local wrapper = function(file, ...) return original(route_sound(file, "voice"), ...) end
+            va.actor_speak_base, selector_wrappers.speak = wrapper, wrapper
+        end
+        scope_sound(va.actor_speak_base, "voice")
+        -- G.A.M.M.A. Voiced Actor's older AGDD (479- Voiced Actor Refined
+        -- disabled) has no actor_speak_base: actor_speak builds the sound
+        -- itself. Its companion quick menu calls it as AGDD_voiced_actor,
+        -- which the engine loads from the same file as a second namespace
+        -- (namespace names are case-sensitive). Both are scoped, but only
+        -- while a gender with voice routes is active: other games never
+        -- touch the module, so they stay exactly GAMMA.
+        if va.actor_speak_base == nil and next(active_routes.voice or {}) ~= nil then
+            scope_sound(va.actor_speak, "voice")
+            local quick_menu = AGDD_voiced_actor
+            if type(quick_menu) == "table" and quick_menu ~= va then scope_sound(quick_menu.actor_speak, "voice") end
+        end
+    end
+    scope_module(actor_effects, {"play_sound_breath_mask", "play_sound_breath", "Update_Impact"}, "voice")
+    scope_module(grok_doom_weapons_inspect, {"play_anim_voice_over"}, "voice")
+    scope_module(grok_progressive_rad_damages, {"play_voice_over"}, "voice")
+    scope_module(zzz_player_injuries, {"play_actor_on_footstep_voice_over"}, "voice")
+    scope_module(footstep_sounds, {"actor_on_footstep", "play_ladder_sound"}, "movement")
+    scope_module(eft_jump_sounds, {"actor_on_jump", "actor_on_land"}, "movement")
+    scope_module(move_effects, {"play_sound"}, "movement")
+    -- FDDA reads item-use sounds from its own ini_file and constructs them in
+    -- the action created by this template (possibly behind its mutator).
+    scope_module(liz_fdda_redone_consumables, {"get_template_action_play_animation_fdda_config"}, "player")
+    -- lam2's generic animation action plays its section's sound key (for
+    -- example the headgear snd_equip/snd_unequip and mutant-skinning snd).
+    scope_module(lam2, {"get_template_action_play_animation"}, "player")
+    -- Actor sound themes (xr_sound.set_sound_play on the actor, for example
+    -- ui_mutant_loot's inv_mutant_loot_animal) construct their sound object
+    -- in sound_theme.actor_sound:play.
+    local themes = sound_theme
+    if themes and themes.actor_sound then scope_sound(themes.actor_sound.play, "player") end
+    install_safe_sound_adapter()
+    retarget_load_time_sounds()
+    install_health_adapter()
+end
+
+function texture(id)
+    local profile = active and active.profiles.health
+    return profile and health_textures(profile)[id] or id
+end
+
+local function find_upvalue(fn, target, visited)
+    if type(fn) ~= "function" then return end
+    visited = visited or {}
+    if visited[fn] then return end
+    visited[fn] = true
+    for n = 1, 200 do
+        local name, value = debug.getupvalue(fn, n)
+        if not name then break end
+        if name == target then return fn, n, value end
+        if type(value) == "function" then
+            local owner, index, found = find_upvalue(value, target, visited)
+            if owner then return owner, index, found end
+        end
+    end
+end
+
+local function init_texture(handle, source)
+    if not handle then return end
+    local selected = texture(source)
+    if health_handles[handle] ~= selected then
+        handle:InitTexture(selected)
+        health_handles[handle] = selected
+    end
+end
+
+local health_progress = {
+    progress_stamina = {"bhs_stamina_bar", "ui_hud_bhs_stamina"},
+    progress_health = {"bhs_health_bar", "ui_hud_bhs_health"},
+}
+for _, part in ipairs({"head", "torso", "rightarm", "leftarm", "rightleg", "leftleg"}) do
+    health_progress["progress_health_" .. part] = {"bhs_health_" .. part .. "_bar", "ui_hud_bhs_bar"}
+    health_progress["progress_health_" .. part .. "_time"] = {"bhs_health_" .. part .. "_bar_green", "ui_hud_bhs_bar_green"}
+end
+
+local function refresh_health(original)
+    local profile = active and active.profiles.health
+    if not profile then return end
+    -- The custom-message template can outlive a save load. Retarget its live
+    -- statics as they appear, while retaining layout and BHS visibility logic.
+    local hud = get_hud and get_hud()
+    if not hud then return end
+    for window, source in pairs(profile.windows or gcs_builtin_presentation.get("gamma_male_health").windows or {}) do
+        local item = hud:GetCustomStatic(window)
+        if item then init_texture(item:wnd(), source) end
+    end
+    local values = {}
+    for n = 1, 200 do
+        local name, value = debug.getupvalue(original, n)
+        if not name then break end
+        values[name] = value
+        if name == "xml" and value then
+            local signature = tostring(profile.revision) .. ":" .. tostring(profile.atlas)
+            local textures = health_textures(profile)
+            for _, key in ipairs(ordered(textures)) do signature = signature .. ":" .. key .. "=" .. textures[key] end
+            if health_xml_signature ~= signature then
+                value:ParseFile("ui_body_health.xml")
+                health_xml_signature = signature
+            end
+        end
+    end
+    local ratio, suffix = values.display_ratio, ""
+    if ratio ~= 169 and values.display and values.display.types[ratio] then suffix = "_" .. tostring(ratio) end
+    for name, mapping in pairs(health_progress) do
+        -- BHS retains a barhandler after RemoveCustomStatic deletes its native
+        -- parent and auto-owned children. ParamBar recreates/reassigns it only
+        -- with that exact owner. Never inspect the cached userdata while its
+        -- current owner is absent, including the post-toggle removal frame.
+        local value = values[name]
+        if value and hud:GetCustomStatic(mapping[1] .. suffix) then
+            if value.GetProgressStatic then init_texture(value:GetProgressStatic(), mapping[2]) end
+        end
+    end
+end
+
+function install_health_adapter()
+    if health_hook or not zzz_player_injuries then return end
+    local owner, index, original = find_upvalue(zzz_player_injuries.actor_on_update, "HUDUpdate")
+    if not owner or type(original) ~= "function" then return end
+    local wrapper = function(...)
+        original(...)
+        refresh_health(original)
+    end
+    debug.setupvalue(owner, index, wrapper)
+    health_hook = wrapper
+end
+
+function notify(old, new)
+    if old and new and not same_values(old.profiles.voice, new.profiles.voice) then
+        -- Stop an old life's active voice clip; retain the provider's existing
+        -- cooldown, chance, shuffle and volume state. actor_effects keeps its
+        -- breathing clip in an upvalue; AGDD keeps the clip it plays in the
+        -- module global file_to_say.
+        local _, _, breath = find_upvalue(actor_effects and actor_effects.play_sound_breath, "breath_sound")
+        local voiced = type(agdd_voiced_actor) == "table" and rawget(agdd_voiced_actor, "file_to_say") or nil
+        for _, sound in ipairs({breath or false, voiced or false}) do
+            if type(sound) == "userdata" or type(sound) == "table" then
+                if sound.stop then sound:stop() end
+            end
+        end
+    end
+    activate(snapshot(new))
+    install_adapters()
+    add_changed_callback()
+    -- Observers may inspect/edit event payloads without changing either the
+    -- private active state or the caller's definitions.
+    SendScriptCallback("gcs_presentation_changed", snapshot(old), snapshot(new))
+end
+
+-- A game with no gender (an unmanaged save, a console new game) never applies
+-- a presentation. Installing the adapters in every game VM, before any save
+-- loads, gives such a game GAMMA's voice through the same wrappers as Male,
+-- also when a voice adapter loaded earlier does not gate itself.
+function on_game_start()
+    install_adapters()
+end

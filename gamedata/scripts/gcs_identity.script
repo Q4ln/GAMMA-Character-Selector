@@ -1,0 +1,668 @@
+-- One managed identity per life. The engine remains authoritative for name,
+-- faction, rank and reputation; only selector-owned data is saved here.
+
+-- Release build: meta.ini version, the README header, the archive name and
+-- the install line in install() carry the same string.
+BUILD = "d2026.10.29.2"
+
+local identity, last_filename
+local installed, callbacks_installed = false, false
+local load_error
+local saved_load = false
+-- Set at this Lua state's first actor registration (prepare_actor_visual).
+local actor_registered = false
+local full_start_previous, full_start_prepared
+local function pack(...) return {n = select("#", ...), ...} end
+local TRANSPORT = "gcs_creation_transport"
+local PROFILE_KINDS = {"body", "voice", "movement", "names", "dialogue", "health"}
+
+-- pSettings survives CALifeSimulator's Lua reset; neither key is saved to disk.
+-- Values stay below CInifile::w_string's native string4096 input buffer.
+local function transport_read(key)
+    local ini = system_ini()
+    if not ini:section_exist(TRANSPORT) or not ini:line_exist(TRANSPORT, key) then
+        return nil, "Missing selector creation transport config"
+    end
+    return ini:r_string(TRANSPORT, key) or ""
+end
+
+local function transport_write(pending, serial)
+    if type(pending) ~= "string" or #pending > 3000 then return false, "Creation transport exceeds its native buffer limit" end
+    local _, why = transport_read("pending")
+    if why then return false, why end
+    local ini = system_ini()
+    ini:save_at_end(false)
+    ini:set_override_names(true)
+    ini:set_readonly(false)
+    local ok, err = pcall(function()
+        if serial then ini:w_string(TRANSPORT, "serial", tostring(serial)) end
+        ini:w_string(TRANSPORT, "pending", pending)
+        assert((ini:r_string(TRANSPORT, "pending") or "") == pending, "Creation transport write did not persist in memory")
+    end)
+    ini:set_readonly(true)
+    ini:set_override_names(false)
+    return ok, err
+end
+
+local function clear_creation()
+    local pending, why = transport_read("pending")
+    if why then return false, why end
+    if pending == "" then return true end
+    return transport_write("")
+end
+
+local function encode(value)
+    return (tostring(value or ""):gsub(".", function(char) return string.format("%02X", char:byte()) end))
+end
+
+local function decode(value)
+    if #value % 2 ~= 0 or value:find("[^%x]") then return nil end
+    return (value:gsub("%x%x", function(hex) return string.char(tonumber(hex, 16)) end))
+end
+
+local function creation_record(raw)
+    if type(raw) ~= "string" or #raw > 3000 then return nil, "Damaged creation transport" end
+    local values = {}
+    for value in (raw .. "|"):gmatch("(.-)|") do values[#values + 1] = value end
+    if #values ~= 12 or values[1] ~= "1" then return nil, "Unsupported creation transport" end
+    for i = 2, #values do
+        values[i] = decode(values[i])
+        if values[i] == nil then return nil, "Damaged creation transport encoding" end
+    end
+    if not values[2]:match("^creation:%d+$") then return nil, "Invalid creation token" end
+    local record = {version = 1, token = values[2], gender = values[3], portrait = values[4], life = 1,
+        required_packages = gcs_registry.split(values[12]), profiles = {}}
+    for i, kind in ipairs(PROFILE_KINDS) do record.profiles[kind] = values[i + 5] end
+    return record, nil, values[5]
+end
+
+local function clone(data)
+    if type(data) ~= "table" then return data end
+    local out = {}
+    for k, v in pairs(data) do out[k] = clone(v) end
+    return out
+end
+
+-- rc15 saves. Male then required the old overwriting Rebase, so every life
+-- stored required_packages = gcs, lass; its body used private copies under
+-- gcs\male, each a copy of the stock file at the same path. This build ships
+-- neither: Male is on stock paths and Female comes from the Rebase's pack.
+local RETIRED_REQUIREMENTS = {lass = true}
+local LEGACY_VISUAL_PREFIX = "gcs\\male\\"
+local legacy_visual_ids = {}
+
+function stock_visual(path)
+    if type(path) ~= "string" then return nil end
+    local normalized = path:gsub("/", "\\")
+    if normalized:sub(1, #LEGACY_VISUAL_PREFIX):lower() ~= LEGACY_VISUAL_PREFIX then return nil end
+    return normalized:sub(#LEGACY_VISUAL_PREFIX + 1)
+end
+
+-- A retired package is dropped only when the saved life's own gender and
+-- profiles no longer require it (Male); a life that still requires it
+-- (Female) keeps it. A changed record is returned as a detached copy.
+function migrate_record(record)
+    if type(record) ~= "table" or type(record.required_packages) ~= "table" then return record end
+    local retired = false
+    for _, id in ipairs(record.required_packages) do
+        if RETIRED_REQUIREMENTS[id] then retired = true; break end
+    end
+    if not retired then return record end
+    local g = gcs_registry.get_identity_gender(record.gender, record.profiles)
+    if not g then return record end
+    local needed = {}
+    for _, id in ipairs((gcs_registry.requirements(g))) do needed[id] = true end
+    local kept, changed = {}, false
+    for _, id in ipairs(record.required_packages) do
+        if RETIRED_REQUIREMENTS[id] and not needed[id] then changed = true else kept[#kept + 1] = id end
+    end
+    if not changed then return record end
+    local migrated = clone(record)
+    migrated.required_packages = kept
+    return migrated
+end
+
+-- A saved visual under gcs\male would be a missing model, which is fatal to
+-- load. Corpses keep the dead actor's visual in their script state, and the
+-- engine copies it into their server packet; both go back to the stock path.
+local function migrate_object_states(data)
+    legacy_visual_ids = {}
+    if type(data) ~= "table" or type(data.se_object) ~= "table" then return end
+    for id, state in pairs(data.se_object) do
+        local visual = type(state) == "table" and stock_visual(state.visual)
+        if visual then
+            state.visual = visual
+            legacy_visual_ids[id] = true
+        end
+    end
+end
+
+-- A refused identity (a load that bypassed preflight) can name a body model
+-- from a package that is no longer installed, for example a Female body
+-- without the Rebase. The engine aborts on a missing model ("Can't find model
+-- file", ModelPool.cpp:120-121) when the object spawns after this callback, so
+-- a missing model takes stock GAMMA's no-outfit body instead.
+local function missing_model(visual)
+    if type(visual) ~= "string" or visual == "" then return false end
+    return not gcs_registry.resource_exists("meshes", visual:gsub("%.[oO][gG][fF]$", "") .. ".ogf")
+end
+
+-- GAMMA's no-outfit body: the one the engine gave a new game of this process
+-- (gcs_presentation's record), else the generator's.
+local function stock_body()
+    if gcs_presentation and gcs_presentation.stock_server_visual then return gcs_presentation.stock_server_visual() end
+    local body = gcs_builtin_presentation and gcs_builtin_presentation.get("gamma_male_body")
+    return body and body.server_visual
+end
+
+local function restore_legacy_visual(se_obj, read, write, refused)
+    local ok, data = pcall(read, se_obj)
+    if not ok or type(data) ~= "table" then return end
+    local visual = stock_visual(data.visual_name)
+        or (refused and missing_model(data.visual_name) and stock_body() or nil)
+    if visual then
+        data.visual_name = visual
+        write(data, se_obj)
+    end
+end
+
+-- Public inspection must not expose the record later serialized into a save.
+function current() return clone(identity) end
+-- A refused identity (load_error) is kept so the next save still stores it,
+-- but its world runs on the stock presentation (the load hook restored the
+-- baseline and load_state never applied it). Its gender and profiles answer
+-- nil, as in an unmanaged game, so no consumer (movement and voice gates, NPC
+-- audio, full-start rollback) acts on a gender the world does not present.
+function gender()
+    if load_error then return nil end
+    return identity and gcs_registry.get_identity_gender(identity.gender, identity.profiles) or nil
+end
+function profile(kind)
+    if load_error then return nil end
+    return identity and gcs_registry.get_identity_profile(identity.gender, identity.profiles, kind) or nil
+end
+function pending_error() return load_error end
+
+local function normalize(filename)
+    if type(filename) ~= "string" then return nil end
+    local value = filename:gsub("\\", "/"):match("([^/]+)$")
+    value = value and value:gsub("%.scop$", ""):gsub("%.scoc$", "")
+    if not value or value == "" or value:find('[";\r\n()]') or value == ".." then return nil end
+    return value:lower()
+end
+
+function save_name(filename) return normalize(filename) end
+
+function read_save(filename)
+    local name = normalize(filename)
+    if not name then return nil, "Invalid save filename" end
+    local path = getFS():update_path("$game_saves$", name .. ".scoc")
+    local file = io.open(path, "rb")
+    if not file then return {}, nil end -- Older saves may have no script state.
+    local bytes = file:read("*all")
+    file:close()
+    if not bytes or bytes == "" then return nil, "Empty script save: " .. name end
+    local ok, data = pcall(marshal.decode, bytes)
+    if not ok or type(data) ~= "table" then return nil, "Unreadable script save: " .. name end
+    return data
+end
+
+local function validate_record(record)
+    if record == nil then return true end
+    if type(record) ~= "table" or record.version ~= 1 or type(record.gender) ~= "string" or type(record.portrait) ~= "string" then
+        return false, "Unsupported or damaged character identity"
+    end
+    if (record.required_packages ~= nil and type(record.required_packages) ~= "table")
+        or (record.profiles ~= nil and type(record.profiles) ~= "table") then
+        return false, "Damaged identity dependency metadata"
+    end
+    record = migrate_record(record)
+    local g, why = gcs_registry.get_identity_gender(record.gender, record.profiles)
+    if not g then return false, why end
+    for _, id in ipairs(record.required_packages or {}) do
+        if type(id) ~= "string" then return false, "Invalid saved package ID" end
+        local ok, reason = gcs_registry.has_package(id)
+        if not ok then return false, reason end
+    end
+    for kind, id in pairs(record.profiles or {}) do
+        if type(kind) ~= "string" or type(id) ~= "string" then return false, "Invalid saved profile ID" end
+        local profile, reason = gcs_registry.get_profile(id)
+        if not profile or profile.type ~= kind then return false, reason or ("Missing saved profile: " .. id) end
+    end
+    if not gcs_registry.portrait_exists(record.portrait) then return false, "Missing saved portrait: " .. record.portrait end
+    return true
+end
+
+function preflight(filename)
+    local data, why = read_save(filename)
+    if not data then return false, why end
+    return validate_record(data.gcs_identity)
+end
+
+function show_error(why, owner)
+    local text = game.translate_string("gcs_load_blocked") .. "\n" .. tostring(why)
+    printf("[GCS] %s", text)
+    if owner and owner.message_box then
+        owner.mbox_mode, owner.msgbox_id = 0, 0
+        owner.message_box:InitMessageBox("message_box_ok")
+        owner.message_box:SetText(text)
+        owner.message_box:ShowDialog(true)
+    elseif actor_menu and actor_menu.set_msg then
+        actor_menu.set_msg(1, text, 15)
+    end
+end
+
+local function signature(record)
+    if not record then return nil end
+    local g = gcs_registry.get_identity_gender(record.gender, record.profiles)
+    return g and gcs_presentation.signature(g) or nil
+end
+
+local function needs_reconnect(filename)
+    if not (level and level.present and level.present()) then return false end
+    local data = read_save(filename)
+    local target = data and data.gcs_identity
+    -- A refused identity's world runs on stock (the load hook restored the
+    -- baseline and load_state never applied it), and its signature is the
+    -- stale saved value, so it counts as an unmanaged world here.
+    local live = not load_error and identity or nil
+    -- Reconnecting between managed/unmanaged worlds also resets native caches.
+    if (live == nil) ~= (target == nil) then return true end
+    return live and live.presentation_signature ~= signature(target) or false
+end
+
+function prepare_full_start()
+    full_start_previous, full_start_prepared = gender(), true
+    local called, ok, why = pcall(gcs_presentation.baseline)
+    if called and ok ~= false then return true end
+    local reason = tostring(called and why or ok)
+    local restored, restore_error = rollback_full_start()
+    return false, reason .. (restored and "" or "; presentation rollback failed: " .. tostring(restore_error))
+end
+
+function rollback_full_start()
+    if not full_start_prepared then return true end
+    local previous = full_start_previous
+    full_start_previous, full_start_prepared = nil, nil
+    if not previous then return true end
+    local called, ok, why = pcall(gcs_presentation.apply, previous)
+    return called and ok ~= false, called and why or ok
+end
+
+-- Only a Lua error is a detectable start failure. exec_console_cmd returns
+-- nothing and the engine defers "start", so a native start that fails later
+-- does so after this Lua state is gone; nothing here can see it. A creation
+-- record such a start leaves behind is discarded when the main menu is shown
+-- again (discard_unconsumed_creation), by the next Start, or by a saved load.
+local function native_menu_call(original, owner, ...)
+    local result = pack(pcall(original, owner, ...))
+    if not result[1] then
+        local restored, why = rollback_full_start()
+        if not restored then printf("[GCS] Failed-load presentation rollback failed: %s", tostring(why)) end
+        error(result[2])
+    end
+    return unpack(result, 2, result.n)
+end
+
+local function reconnect(filename)
+    local ok, why = prepare_full_start()
+    if not ok then return false, why end
+    local called, problem = pcall(function()
+        exec_console_cmd("main_menu off")
+        exec_console_cmd("start server(" .. normalize(filename) .. "/single/alife/load) client(localhost)")
+    end)
+    if not called then
+        rollback_full_start()
+        return false, tostring(problem)
+    end
+    return true
+end
+
+local function allow_load(filename, owner)
+    local ok, why = preflight(filename)
+    if not ok then show_error(why, owner); return false end
+    if needs_reconnect(filename) then
+        local started, reason = reconnect(filename)
+        if not started then show_error(reason, owner) end
+        return false
+    end
+    -- Both native menu load implementations use start server(.../load) when
+    -- alife() is nil; preserve baseline before that full Lua reset as well.
+    if alife() == nil then
+        local prepared, reason = prepare_full_start()
+        if not prepared then show_error(reason, owner); return false end
+    end
+    return true
+end
+
+local function notify_presentation(old, current)
+    -- Presentation and identity have already committed. An observer's failure
+    -- must not make the caller retry possession and increment another life.
+    local ok, why = pcall(gcs_presentation.notify, old, current)
+    if not ok then printf("[GCS] Presentation notification failed after identity commit: %s", tostring(why)) end
+end
+
+function stage(gender_id, portrait, faction)
+    -- Discard a rejected/abandoned candidate before validating a replacement.
+    local cleared, clear_error = cancel_creation()
+    if not cleared then return false, clear_error end
+    local valid, why = gcs_registry.validate_gender(gender_id)
+    if not valid then return false, why end
+    if not gcs_registry.portrait_exists(portrait) then return false, "Missing portrait: " .. tostring(portrait) end
+    local allowed = false
+    for _, icon in ipairs(gcs_registry.pool(gender_id, faction)) do
+        if icon == portrait then allowed = true; break end
+    end
+    if not allowed then return false, "Portrait is outside this gender and faction pool" end
+    local g = gcs_registry.get_gender(gender_id)
+    local packages, refs = gcs_registry.requirements(g)
+    local serial = tonumber((transport_read("serial")))
+    if not serial or serial < 0 or serial ~= math.floor(serial) or serial >= 2147483647 then
+        return false, "Invalid creation transport serial"
+    end
+    serial = serial + 1
+    local fields = {"1", encode("creation:" .. serial), encode(gender_id), encode(portrait), encode(faction)}
+    for _, kind in ipairs(PROFILE_KINDS) do fields[#fields + 1] = encode(refs[kind]) end
+    fields[#fields + 1] = encode(table.concat(packages, ","))
+    local raw = table.concat(fields, "|")
+    if #raw > 3000 then return false, "Creation transport exceeds its native buffer limit" end
+    -- Validate the new body without applying its values in this soon-to-be-
+    -- destroyed Lua VM (signature also records any owned key's stock value
+    -- the process record lacks). An existing managed world is restored before
+    -- disconnect; restores read the process record, never this VM's state.
+    local valid_signature, result = pcall(gcs_presentation.signature, g)
+    if not valid_signature or type(result) ~= "string" then return false, tostring(result) end
+    local ok, reason = prepare_full_start()
+    if ok == false then return false, reason end
+    local written, err = transport_write(raw, serial)
+    if not written then cancel_creation(); return false, err end
+    saved_load, actor_registered = false, false
+    return true
+end
+
+function cancel_creation()
+    local ok, why = clear_creation()
+    local restored, reason = rollback_full_start()
+    if not restored then return false, reason end
+    return ok, why
+end
+
+-- Called whenever the main menu is constructed (main_menu_on_init, which the
+-- engine raises each time it shows the menu). A creation record is consumed
+-- by actor registration in the game it was staged for, before that game can
+-- show the menu. One still pending here belongs to a start that failed after
+-- its Lua state was gone; discard it so no later, unrelated new game uses it.
+function discard_unconsumed_creation()
+    local pending, why = transport_read("pending")
+    if not pending then return false, why end
+    if pending == "" then return true end
+    printf("[GCS] Discarding a character creation that no game consumed")
+    return clear_creation()
+end
+
+local function consume_creation()
+    if saved_load then return true end
+    local raw, why = transport_read("pending")
+    if not raw then return false, why end
+    if raw == "" then
+        -- An unmanaged new game, however it was started (a raw console start
+        -- skips every menu hook), begins from the recorded stock values. A
+        -- managed game's repeated registration keeps its consumed identity.
+        if identity ~= nil then return true end
+        local called, restored, problem = pcall(gcs_presentation.baseline)
+        if not called or restored == false then
+            printf("[GCS] Stock presentation restore failed for an unmanaged new game: %s",
+                tostring(called and problem or restored))
+        end
+        return true
+    end
+    -- Consume before validation/application: duplicate actor registration or an
+    -- unsuccessful start can never replay a creation token.
+    local cleared, err = clear_creation()
+    if not cleared then return false, err end
+    full_start_previous, full_start_prepared = nil, nil
+    local candidate, problem, faction = creation_record(raw)
+    if not candidate then return false, problem end
+    local valid, reason = validate_record(candidate)
+    if not valid then return false, reason end
+    local allowed = false
+    for _, icon in ipairs(gcs_registry.pool(candidate.gender, faction)) do
+        if icon == candidate.portrait then allowed = true; break end
+    end
+    if not allowed then return false, "Creation portrait no longer belongs to its faction/gender pool" end
+    local g = gcs_registry.get_identity_gender(candidate.gender, candidate.profiles)
+    local old = gender()
+    local called, applied, apply_error = pcall(gcs_presentation.apply, g)
+    if not called or applied == false then return false, tostring(called and apply_error or applied) end
+    candidate.presentation_signature = gcs_presentation.signature(g)
+    identity, load_error, last_filename = candidate, nil, nil
+    if gcs_dialogue then gcs_dialogue.select(g.profiles.dialogue) end
+    notify_presentation(old, g)
+    printf("[GCS] New character identity consumed before actor spawn: %s (%s)", candidate.gender, candidate.token)
+    return true
+end
+
+function possess(gender_id, portrait, faction, specific_character, token)
+    -- Caller contract: apply the validated presentation before committing here.
+    -- Azazel owns that ordering before constructing the possessed life's gear.
+    if not identity then return false, "Unmanaged save" end
+    if token and identity.token == token then return true end
+    local g, why = gcs_registry.get_gender(gender_id)
+    if not g then return false, why end
+    if not gcs_registry.portrait_exists(portrait) then return false, "Missing possessed portrait: " .. tostring(portrait) end
+    local required, refs = gcs_registry.requirements(g)
+    local old = gender()
+    identity = {version = 1, gender = gender_id, portrait = portrait,
+        life = (tonumber(identity.life) or 1) + 1, source_npc = specific_character,
+        required_packages = required, profiles = refs, token = token,
+        presentation_signature = gcs_presentation.signature(g)}
+    -- The new life is validated and presented (caller contract), so a refusal
+    -- that belonged to the previous life no longer applies.
+    load_error = nil
+    if gcs_dialogue then gcs_dialogue.select(g.profiles.dialogue) end
+    notify_presentation(old, g)
+    return true
+end
+
+function restore_portrait()
+    if load_error or type(identity) ~= "table" or not db or not db.actor then return end
+    local wanted = identity.portrait
+    if db.actor:character_icon() ~= wanted then db.actor:set_character_icon(wanted) end
+    if db.actor_binder then db.actor_binder.character_icon = wanted end
+end
+
+local function prepare_actor_visual(se_obj, type_name)
+    if type_name ~= "se_actor" then
+        if se_obj and legacy_visual_ids[se_obj.id] then
+            legacy_visual_ids[se_obj.id] = nil
+            restore_legacy_visual(se_obj, utils_stpk.get_stalker_data, utils_stpk.set_stalker_data, load_error ~= nil)
+        end
+        return
+    end
+    -- A new game's first actor registration holds the engine's own no-outfit
+    -- body, before anything writes the packet. Male restores that record over
+    -- another gender's body (gcs_presentation.server_visual).
+    if not saved_load and not actor_registered and gcs_presentation.record_server_visual then
+        local spawned = utils_stpk.get_actor_data(se_obj)
+        local recorded, record_error = gcs_presentation.record_server_visual(spawned and spawned.visual_name)
+        if not recorded then printf("[GCS] %s", tostring(record_error)) end
+    end
+    actor_registered = true
+    local consumed, why = consume_creation()
+    if not consumed then
+        load_error = "New character identity transfer failed: " .. tostring(why)
+        error("[GCS] " .. load_error)
+    end
+    if not identity then return end
+    if load_error then
+        -- A refused identity keeps its actor, but not a retired rc15 copy or a
+        -- body model that is no longer installed.
+        restore_legacy_visual(se_obj, utils_stpk.get_actor_data, utils_stpk.set_actor_data, true)
+        return
+    end
+    local g = gender()
+    if not g then return end
+    local data = utils_stpk.get_actor_data(se_obj)
+    assert(data, "GCS could not read the actor spawn packet")
+    -- nil: Male keeps the packet's body (gcs_presentation.server_visual).
+    local visual = gcs_presentation.server_visual(g, data.visual_name)
+    assert(visual ~= "", "GCS managed actor has no default body visual")
+    if visual and data.visual_name ~= visual then
+        -- This server callback runs before online CActor::net_Spawn captures
+        -- its no-outfit visual. Preserve all unrelated actor packet fields.
+        data.visual_name = visual
+        utils_stpk.set_actor_data(data, se_obj)
+    end
+end
+
+function notify()
+    restore_portrait()
+    if gcs_dialogue then gcs_dialogue.refresh_safe() end
+end
+
+local function save_state(data)
+    data.gcs_identity = identity and clone(identity) or nil
+end
+
+local function load_state(data)
+    identity, load_error = nil, nil
+    migrate_object_states(data)
+    local record = data.gcs_identity
+    if record then
+        -- Retain unresolved custom identity tables; malformed scalars cannot be
+        -- exposed as a managed identity to other component APIs. The migrated
+        -- record is the one the next save stores.
+        identity = type(record) == "table" and migrate_record(clone(record)) or nil
+        local ok, why = validate_record(record)
+        if not ok then
+            load_error = why
+            -- Corpses of this identity's earlier lives may wear a body model
+            -- that is no longer installed; the engine copies it into their packet.
+            for id, state in pairs(type(data.se_object) == "table" and data.se_object or {}) do
+                if type(state) == "table" and missing_model(state.visual) and stock_body() then
+                    state.visual = stock_body()
+                    legacy_visual_ids[id] = true
+                end
+            end
+            printf("[GCS] Native load bypassed dependency preflight: %s", tostring(why))
+            return
+        end
+        local g = gender()
+        local applied, err = gcs_presentation.apply(g)
+        if applied == false then load_error = err; return end
+        identity.presentation_signature = gcs_presentation.signature(g)
+        if gcs_dialogue then gcs_dialogue.select(g.profiles.dialogue) end
+    else
+        gcs_presentation.baseline()
+        if gcs_dialogue then gcs_dialogue.select(nil) end
+    end
+end
+
+local function first_update()
+    if load_error then show_error(load_error); return end
+    restore_portrait()
+end
+
+local function newest_save(quick)
+    local fs = getFS()
+    local list = fs:file_list_open_ex("$game_saves$", bit_or(FS.FS_ListFiles, FS.FS_RootOnly), "*.scop")
+    if not list then return nil end
+    list:Sort(FS.FS_sort_by_modif_down)
+    for i = 0, list:Size() - 1 do
+        local name = normalize(list:GetAt(i):NameFull())
+        if name and (not quick or name:match(".* %- quicksave_(%d+)")) then return name end
+    end
+end
+
+local function before_quickload(dik, bind, flags)
+    if flags.ret then return end
+    local name = newest_save(true)
+    if name and not allow_load(name, nil) then flags.ret = true end
+end
+
+function install()
+    -- The native string table may outlive a full load's Lua namespace. Restore
+    -- the dialogue catalog before any registry-backed dependency preflight.
+    if gcs_dialogue and gcs_dialogue.install then gcs_dialogue.install() end
+    if not installed then
+        installed = true
+        printf("[GCS] installed | build=%s | identity, save preflight and Azazel hooks", BUILD)
+        -- Install before the engine's pre-object load callback, not first update.
+        local original_load = alife_storage_manager.CALifeStorageManager_load
+        alife_storage_manager.CALifeStorageManager_load = function(filename, ...)
+            saved_load = true
+            full_start_previous, full_start_prepared = nil, nil
+            local cleared, why = clear_creation()
+            if not cleared then printf("[GCS] Creation transport ignored during saved load: %s", tostring(why)) end
+            identity, load_error = nil, nil
+            legacy_visual_ids = {}
+            gcs_presentation.baseline()
+            if gcs_dialogue then gcs_dialogue.select(nil) end
+            if gcs_npc_audio and gcs_npc_audio.reset_for_load then gcs_npc_audio.reset_for_load() end
+            if gcs_azazel then gcs_azazel.reset_for_load() end
+            last_filename = normalize(filename)
+            -- A missing .scoc returns without load_state in the engine script.
+            return original_load(filename, ...)
+        end
+        local original_saved = alife_storage_manager.CALifeStorageManager_save
+        alife_storage_manager.CALifeStorageManager_save = function(filename, ...)
+            last_filename = normalize(filename)
+            return original_saved(filename, ...)
+        end
+        local load_dialog = ui_load_dialog and ui_load_dialog.UILoadDialog
+        if load_dialog then
+            local original = load_dialog.load_game_internal
+            load_dialog.load_game_internal = function(self, ...)
+                local index = self.list_box:GetSelectedIndex()
+                local item = index ~= -1 and self.list_box:GetItemByIndex(index)
+                if item and not allow_load(item.fn:GetText(), self) then return end
+                return native_menu_call(original, self, ...)
+            end
+        end
+        local menu = ui_main_menu and ui_main_menu.main_menu
+        if menu then
+            local original_continue = menu.OnButton_last_save
+            menu.OnButton_last_save = function(self, ...)
+                if alife() == nil then
+                    local filename = newest_save(false)
+                    if filename and not allow_load(filename, self) then return end
+                end
+                return native_menu_call(original_continue, self, ...)
+            end
+            local original_last = menu.LoadLastSave
+            menu.LoadLastSave = function(self, ...)
+                local filename = last_filename
+                if not filename then
+                    -- No exposed native last-save getter: do not guess and load
+                    -- another campaign when attaching to an already running world.
+                    show_error(game.translate_string("gcs_choose_save"), self)
+                    return
+                end
+                if not allow_load(filename, self) then return end
+                return native_menu_call(original_last, self, ...)
+            end
+        end
+    end
+    if not callbacks_installed then
+        -- The menu can install us before axr_main scans all script namespaces.
+        -- GAMMA's owner adds the loading/mouse intercepts when this module loads.
+        local engine_callback_owner = callbacks_gameobject
+        callbacks_installed = true
+        RegisterScriptCallback("save_state", save_state)
+        RegisterScriptCallback("load_state", load_state)
+        RegisterScriptCallback("actor_on_first_update", first_update)
+        RegisterScriptCallback("server_entity_on_register", prepare_actor_visual)
+        RegisterScriptCallback("actor_item_to_slot", restore_portrait)
+        RegisterScriptCallback("actor_item_to_ruck", restore_portrait)
+        RegisterScriptCallback("on_before_load_input", before_quickload)
+        RegisterScriptCallback("on_loading_screen_key_prompt", notify)
+    end
+    if gcs_azazel then gcs_azazel.install() end
+end
+
+function on_game_start()
+    identity, load_error, last_filename = nil, nil, nil
+    saved_load, actor_registered = false, false
+    full_start_previous, full_start_prepared = nil, nil
+    install()
+end

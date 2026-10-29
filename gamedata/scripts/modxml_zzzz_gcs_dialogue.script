@@ -1,0 +1,6 @@
+local installed = false
+function on_xml_read()
+    if installed then return end
+    installed = true
+    RegisterScriptCallback("on_xml_read", gcs_dialogue.on_xml)
+end

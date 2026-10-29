@@ -1,0 +1,166 @@
+<?xml version='1.0' encoding='windows-1251'?>
+<string_table>
+  <string id="st_gcs_templates_button">
+    <text>Пресеты</text>
+  </string>
+  <string id="st_gcs_templates_title">
+    <text>Пресеты персонажа</text>
+  </string>
+  <string id="st_gcs_templates_name">
+    <text>Пресет</text>
+  </string>
+  <string id="st_gcs_templates_new">
+    <text>Новый</text>
+  </string>
+  <string id="st_gcs_templates_save">
+    <text>Сохранить</text>
+  </string>
+  <string id="st_gcs_templates_load">
+    <text>Применить</text>
+  </string>
+  <string id="st_gcs_templates_delete">
+    <text>Удалить</text>
+  </string>
+  <string id="st_gcs_templates_close">
+    <text>Закрыть</text>
+  </string>
+  <string id="st_gcs_templates_empty">
+    <text>Пустая ячейка</text>
+  </string>
+  <string id="st_gcs_templates_hint">
+    <text>Примените или обновите пресет. Нажмите «Новый», чтобы сохранить другой.</text>
+  </string>
+  <string id="st_gcs_templates_new_hint">
+    <text>Введите название настроек и нажмите «Сохранить».</text>
+  </string>
+  <string id="st_gcs_templates_full">
+    <text>Сохранено 24 пресета. Удалите один, чтобы добавить новый.</text>
+  </string>
+  <string id="st_gcs_templates_selection_changed">
+    <text>Список пресетов изменился. Выберите пресет ещё раз.</text>
+  </string>
+  <string id="st_gcs_templates_empty_state">
+    <text>Пока нет сохранённых пресетов.
+Введите название текущих настроек выше и нажмите «Сохранить».</text>
+  </string>
+  <string id="st_gcs_templates_name_required">
+    <text>Введите название пресета (до 240 байт).</text>
+  </string>
+  <string id="st_gcs_templates_storage_error">
+    <text>Хранилище пресетов недоступно.</text>
+  </string>
+  <string id="st_gcs_templates_damaged">
+    <text>Не удалось прочитать пресет.</text>
+  </string>
+  <string id="st_gcs_templates_overwrite_confirm">
+    <text>Нажмите «Сохранить» ещё раз, чтобы обновить пресет.</text>
+  </string>
+  <string id="st_gcs_templates_delete_confirm">
+    <text>Нажмите «Удалить» ещё раз, чтобы удалить пресет.</text>
+  </string>
+  <string id="st_gcs_templates_saved">
+    <text>Пресет сохранён.</text>
+  </string>
+  <string id="st_gcs_templates_deleted">
+    <text>Пресет удалён.</text>
+  </string>
+  <string id="st_gcs_templates_identity_label">
+    <text>Персонаж</text>
+  </string>
+  <string id="st_gcs_templates_start_detail_label">
+    <text>Старт</text>
+  </string>
+  <string id="st_gcs_templates_rules_label">
+    <text>Режимы</text>
+  </string>
+  <string id="st_gcs_templates_difficulty_label">
+    <text>Игра</text>
+  </string>
+  <string id="st_gcs_templates_economy_label">
+    <text>Прогрессия</text>
+  </string>
+  <string id="st_gcs_templates_location_label">
+    <text>Старт</text>
+  </string>
+  <string id="st_gcs_templates_on">
+    <text>Вкл.</text>
+  </string>
+  <string id="st_gcs_templates_off">
+    <text>Выкл.</text>
+  </string>
+  <string id="st_gcs_templates_separator">
+    <text>·</text>
+  </string>
+  <string id="st_gcs_templates_lives_label">
+    <text>Жизни</text>
+  </string>
+  <string id="st_gcs_templates_regen_label">
+    <text>Восстановление жизни</text>
+  </string>
+  <string id="st_gcs_templates_timer_label">
+    <text>Интервал сохранений</text>
+  </string>
+  <string id="st_gcs_templates_days">
+    <text>дн.</text>
+  </string>
+  <string id="st_gcs_templates_hours">
+    <text>ч.</text>
+  </string>
+  <string id="st_gcs_templates_minutes">
+    <text>мин.</text>
+  </string>
+  <string id="st_gcs_templates_empty_row">
+    <text>Для новых настроек персонажа</text>
+  </string>
+  <string id="st_gcs_templates_empty_detail">
+    <text>Сохраните текущего персонажа как новый пресет</text>
+  </string>
+  <string id="st_gcs_templates_empty_start">
+    <text>Локация / сложность / экономика</text>
+  </string>
+  <string id="st_gcs_templates_empty_rules">
+    <text>Введите название выше и нажмите «Сохранить»</text>
+  </string>
+  <string id="st_gcs_templates_unspecified">
+    <text>Не указано</text>
+  </string>
+  <string id="st_gcs_templates_legacy_gender">
+    <text>Пол не сохранён</text>
+  </string>
+  <string id="st_gcs_templates_missing_gender">
+    <text>Недоступный пол</text>
+  </string>
+  <string id="st_gcs_templates_unnamed_character">
+    <text>Персонаж без имени</text>
+  </string>
+  <string id="st_gcs_templates_freeplay">
+    <text>Свободная игра</text>
+  </string>
+  <string id="st_gcs_templates_mode_story">
+    <text>Сюжет</text>
+  </string>
+  <string id="st_gcs_templates_mode_hardcore">
+    <text>Железная воля</text>
+  </string>
+  <string id="st_gcs_templates_mode_azazel">
+    <text>Азазель</text>
+  </string>
+  <string id="st_gcs_templates_mode_survival">
+    <text>Выживание</text>
+  </string>
+  <string id="st_gcs_templates_mode_warfare">
+    <text>Война группировок</text>
+  </string>
+  <string id="st_gcs_templates_mode_soulslike">
+    <text>Soulslike</text>
+  </string>
+  <string id="st_gcs_templates_mode_campfire">
+    <text>Сохранения у костра</text>
+  </string>
+  <string id="st_gcs_templates_mode_conditions">
+    <text>Режим агонии</text>
+  </string>
+  <string id="st_gcs_templates_mode_routes">
+    <text>Доступная Зона</text>
+  </string>
+</string_table>

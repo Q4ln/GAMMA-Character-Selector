@@ -1,0 +1,29 @@
+-- MCM discovery finishes before main_menu:InitCallBacks. Runtime hooks must
+-- exist before Continue's function is captured by its first button callback.
+local function install_runtime()
+    if gcs_identity and gcs_identity.install then gcs_identity.install() end
+    if gcs_azazel and gcs_azazel.install then gcs_azazel.install() end
+    if gcs_npc_audio and gcs_npc_audio.install then gcs_npc_audio.install() end
+end
+
+local menu = ui_main_menu and ui_main_menu.main_menu
+if menu and menu.InitCallBacks and not menu.GCS_RUNTIME_BOOTSTRAP_INSTALLED then
+    menu.GCS_RUNTIME_BOOTSTRAP_INSTALLED = true
+    local previous_callbacks = menu.InitCallBacks
+    function menu.InitCallBacks(self, ...)
+        install_runtime()
+        return previous_callbacks(self, ...)
+    end
+end
+
+-- Creation UI wrappers are installed after discovery and menu initialization,
+-- before UINewGame is constructed. Subsequent calls are idempotent.
+local function install_ui()
+    install_runtime()
+    if gcs_ui and gcs_ui.install then gcs_ui.install() end
+    if gcs_templates and gcs_templates.install then gcs_templates.install() end
+end
+if not menu or not menu.GCS_MENU_CALLBACK_REGISTERED then
+    if menu then menu.GCS_MENU_CALLBACK_REGISTERED = true end
+    RegisterScriptCallback("main_menu_on_init", install_ui)
+end

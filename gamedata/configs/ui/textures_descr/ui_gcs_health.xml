@@ -1,0 +1,16 @@
+<?xml version='1.0' encoding='utf-8'?>
+<w>
+<file name="ui\ui_body_health_system3">
+		<!-- body health system -->
+		<texture id="gcs_bhs_layout_ui_hud_bhs_bg"		x="0" y="12" width="317" height="217" />
+		<texture id="gcs_bhs_layout_ui_hud_bhs_health"		x="426" y="0" width="48" height="124" />
+		<texture id="gcs_bhs_layout_ui_hud_bhs_bar"		x="0" y="229" width="38" height="5" />
+		<texture id="gcs_bhs_layout_ui_hud_bhs_bar_green"		x="38" y="229" width="38" height="5" />
+		<texture id="gcs_bhs_layout_ui_hud_bhs_stamina"		x="0" y="235" width="134" height="14" />
+		
+
+		<texture id="gcs_bhs_layout_ui_hud_bhs_health_bg"		x="426" y="132" width="48" height="124" />
+		<texture id="gcs_bhs_layout_ui_hud_bhs_bar_bg"		x="0" y="265" width="38" height="5" />
+		<texture id="gcs_bhs_layout_ui_hud_bhs_stamina_bg"		x="0" y="250" width="134" height="14" />
+	</file>
+</w>

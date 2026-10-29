@@ -1,0 +1,60 @@
+-- Preserve LASS animation files and IDs; fit their opaque 144px band to 123:87.
+-- DXML registers modxml callbacks before native texture descriptors are read.
+local installed = false
+local portraits = {
+    ui_a_portret_animated_female_bandit = true,
+    ui_a_portret_animated_female_csky = true,
+    ui_a_portret_animated_female_dolg = true,
+    ui_a_portret_animated_female_ecolog = true,
+    ui_a_portret_animated_female_freedom = true,
+    ui_a_portret_animated_female_stalker = true,
+    ui_a_portret_animated_female_army = true,
+    ui_a_portret_animated_female_monolith = true,
+    ui_a_portret_animated_female_monolith_alt = true,
+    ui_a_portret_animated_female_no_data = true,
+    ui_a_portret_animated_female_zombied = true,
+    ui_a_portret_animated_female_renegade = true,
+    ui_a_portret_animated_female_greh = true,
+    ui_a_portret_animated_female_isg = true,
+    ui_a_portret_animated_female_killer = true,
+}
+
+local function frame_portraits(filename, xml)
+    if filename:lower():gsub("/", "\\") ~= "ui\\textures_descr\\ui_animated_female_portraits.xml" then return end
+    for _, element in ipairs(xml:query("texture")) do
+        local attr = xml:getElementAttr(element)
+        -- Do not replace custom framing supplied by another mod. Reprocessing
+        -- the corrected descriptor also naturally leaves its values intact.
+        if portraits[attr.id] and tonumber(attr.x) == 0 and tonumber(attr.y) == 56
+            and tonumber(attr.width) == 256 and tonumber(attr.height) == 144 then
+            xml:setElementAttr(element, {
+                x = "26.20689655", y = "56", width = "203.5862069", height = "144",
+            })
+        end
+    end
+end
+
+-- Thumbnail crops declared by a pack (kind = thumbnails) become texture IDs on
+-- the pack's own frame files; the selector ships no copy of that art.
+local function attribute(value) return tostring(value):gsub('[&<>"]', "") end
+
+local function add_thumbnails(filename, xml)
+    if filename:lower():gsub("/", "\\") ~= "ui\\textures_descr\\ui_gcs_portrait_thumbnails.xml" then return end
+    if not (gcs_registry and gcs_registry.thumbnails) then return end
+    local defined = {}
+    for _, texture in ipairs(xml:query("texture")) do defined[xml:getElementAttr(texture).id or ""] = true end
+    for _, item in ipairs(gcs_registry.thumbnails()) do
+        if not defined[item.id] then
+            defined[item.id] = true
+            xml:insertFromXMLString('<file name="' .. attribute(item.texture) .. '"><texture id="' .. attribute(item.id)
+                .. '" x="' .. item.x .. '" y="' .. item.y .. '" width="' .. item.width .. '" height="' .. item.height .. '" /></file>')
+        end
+    end
+end
+
+function on_xml_read()
+    if installed then return end
+    installed = true
+    RegisterScriptCallback("on_xml_read", frame_portraits)
+    RegisterScriptCallback("on_xml_read", add_thumbnails)
+end

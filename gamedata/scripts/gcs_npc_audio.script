@@ -1,0 +1,662 @@
+-- Per-speaker NPC audio routing; no global NPC voice-prefix/config writes.
+local installed = false
+local native_state = {}
+local hit_by_actor = {}
+local held = {}
+local aliases_by_profile = {}
+local native_by_profile = {}
+local scoped_trader
+local scoped_actor_help = false
+local helped_by_actor = {}
+local restoring_native = false
+local banks = {}
+local function pack(...) return {n=select("#",...),...} end
+local function norm(path) return tostring(path or ""):gsub("/", "\\"):lower() end
+local function data() return gcs_npc_audio_data.data end
+
+-- Pack NPC voice banks: a dialogue profile's npc_bank names an LTX under
+-- configs with [npc_set_*] sections. Each numbered set lists, per index, a
+-- file shipped by the pack (pack_set/lass_set + n), an installed file
+-- (installed_paths) or the stock file (stock_set + n), so a pack can keep a
+-- set gap-free without shipping stock clips. Sets apply only while that
+-- dialogue profile is selected.
+local function sound_exists(path) return gcs_registry.resource_exists("sounds", path .. ".ogg") end
+
+local function bank_fields(ini, section)
+    local result = {}
+    if not ini:section_exist(section) then return result end
+    for i = 0, ini:line_count(section) - 1 do
+        local _, key, value = ini:r_line(section, i, "", "")
+        if type(key) == "string" then result[key] = type(value) == "string" and value or "" end
+    end
+    return result
+end
+
+local function bank_path(value)
+    local path = norm(value):match("^%s*(.-)%s*$")
+    if path == "" or path:match("^\\") or path:find(":", 1, true) or path:find("..", 1, true)
+        or path:find("[\r\n,]") or path:match("%.ogg$") then return nil end
+    return path
+end
+
+local function bank_indices(value)
+    local result, seen = {}, {}
+    for item in tostring(value or ""):gmatch("[^,]+") do
+        item = item:match("^%s*(.-)%s*$")
+        if item ~= "" then
+            local n = tonumber(item)
+            if not n or n < 0 or n > 99 or n ~= math.floor(n) or seen[n] then return nil end
+            seen[n] = true
+            result[#result + 1] = n
+        end
+    end
+    return result
+end
+
+local function bank_list(value)
+    local result = {}
+    for item in tostring(value or ""):gmatch("[^,]+") do
+        item = item:match("^%s*(.-)%s*$")
+        if item ~= "" then
+            local path = bank_path(item)
+            if not path then return nil end
+            result[#result + 1] = path
+        end
+    end
+    return result
+end
+
+local function bank_set(file, section, f)
+    local stock = bank_path(f.stock_set)
+    if not stock then return nil, "Invalid stock_set in NPC voice bank: " .. section end
+    local set = {key = "gcs-pack:" .. file .. ":" .. stock, stock = stock, paths = {}, extra = {}}
+    if f.single == "true" then
+        local target = bank_path(f.path)
+        if not target or not sound_exists(target) then return nil, "Missing single NPC voice file: " .. section end
+        set.single = target
+        return set
+    end
+    local prefix = bank_path(f.pack_set or f.lass_set)
+    local count = tonumber(f.count)
+    local packed = bank_indices(f.pack_indices or f.lass_indices)
+    local installed, installed_paths = bank_indices(f.installed_indices), bank_list(f.installed_paths)
+    local stocked, explicit = bank_indices(f.stock_indices), bank_indices(f.explicit_indices)
+    local unreachable = bank_indices(f.unreachable_pack_indices or f.unreachable_lass_indices)
+    -- count 0 is valid: no number is reachable by sound_theme, and the set
+    -- only supplies engine-loaded (unreachable) members to native barks.
+    if not prefix or not count or count < 0 or count > 64 or count ~= math.floor(count) or not packed or not installed
+        or not installed_paths or #installed_paths ~= #installed or not stocked or not explicit or not unreachable then
+        return nil, "Invalid numbered NPC voice set: " .. section
+    end
+    local function add(index, target)
+        if set.paths[index] then return false end
+        set.paths[index] = target
+        return sound_exists(target)
+    end
+    for _, n in ipairs(packed) do if not add(n, prefix .. n) then return nil, "Missing or repeated NPC voice member: " .. section .. "/" .. n end end
+    for i, n in ipairs(installed) do if not add(n, installed_paths[i]) then return nil, "Missing or repeated NPC voice member: " .. section .. "/" .. n end end
+    for _, n in ipairs(stocked) do if not add(n, stock .. n) then return nil, "Missing or repeated NPC voice member: " .. section .. "/" .. n end end
+    -- The run 1..count is what sound_theme reaches; explicit indices are
+    -- played by full name. Together they must be exactly the listed members.
+    local wanted = {}
+    for n = 1, count do wanted[n] = true end
+    for _, n in ipairs(explicit) do wanted[n] = true end
+    for n in pairs(set.paths) do if not wanted[n] then return nil, "NPC voice member outside the set: " .. section .. "/" .. n end end
+    for n in pairs(wanted) do if not set.paths[n] then return nil, "NPC voice set has a gap: " .. section .. "/" .. n end end
+    for _, n in ipairs(unreachable) do
+        if set.paths[n] or not sound_exists(prefix .. n) then return nil, "Invalid unreachable NPC voice member: " .. section .. "/" .. n end
+        set.extra[n] = prefix .. n
+    end
+    set.theme_paths = {}
+    for n = 1, count do set.theme_paths[n] = set.paths[n] end
+    set.theme_list = table.concat(set.theme_paths, ",")
+    return set
+end
+
+local function build_bank(path)
+    local file = norm(path):match("^%s*(.-)%s*$")
+    if file == "" or file:match("^\\") or file:find(":", 1, true) or file:find("..", 1, true) or not file:match("%.ltx$") then
+        return nil, "NPC voice bank must be a relative .ltx path under configs: " .. tostring(path)
+    end
+    if not gcs_registry.resource_exists("configs", file) then return nil, "Missing NPC voice bank: " .. file end
+    local ini = ini_file(file)
+    local sections = {}
+    ini:section_for_each(function(section) if section:match("^npc_set_") then sections[#sections + 1] = section end end)
+    table.sort(sections)
+    if #sections == 0 then return nil, "NPC voice bank has no npc_set_ sections: " .. file end
+    local declared = bank_fields(ini, "npc_sets").count
+    if declared and declared ~= "" and tonumber(declared) ~= #sections then return nil, "NPC voice bank set count mismatch: " .. file end
+    local bank = {file = file, sets = {}, members = {}, lines = {}}
+    for _, section in ipairs(sections) do
+        local set, why = bank_set(file, section, bank_fields(ini, section))
+        if not set then return nil, why end
+        if bank.sets[set.stock] then return nil, "Duplicate stock_set in NPC voice bank: " .. section end
+        bank.sets[set.stock] = set
+        local pairs_to_map = {}
+        if set.single then pairs_to_map[set.stock] = set.single
+        else for n, target in pairs(set.paths) do pairs_to_map[set.stock .. n] = target end end
+        for original, target in pairs(pairs_to_map) do
+            if bank.members[original] and bank.members[original] ~= target then return nil, "Conflicting NPC voice member: " .. original end
+            bank.members[original] = target
+            if target ~= original then bank.lines[target] = original end
+        end
+    end
+    return bank
+end
+
+local function load_bank(path)
+    if type(path) ~= "string" then return nil, "Invalid npc_bank" end
+    local cached = banks[path]
+    if not cached then
+        local bank, why = build_bank(path)
+        cached = {bank = bank, why = why}
+        banks[path] = cached
+    end
+    return cached.bank, cached.why
+end
+
+local function bank_routes(profile, addressed)
+    if not profile or type(profile.npc_bank) ~= "string" then return nil end
+    if not addressed and profile.npc_bank_scope ~= "all" then return nil end
+    return (load_bank(profile.npc_bank))
+end
+
+-- A numbered set or single file from the selected profile's bank. An explicit
+-- authored route for an actor-addressed audited collection keeps precedence.
+local function route_set(original, profile, addressed)
+    local full = norm(original)
+    if addressed and profile and profile.routes and profile.routes[full] and data().series[full] then return nil end
+    local bank = bank_routes(profile, addressed)
+    return bank and bank.sets[full] or nil
+end
+
+-- Sound themes walk 1..count; a set with no such member keeps the stock theme.
+local function theme_set(set)
+    if set and (set.single or #set.theme_paths > 0) then return set end
+end
+
+-- Only the selected dialogue profile's own bank: a bank loaded in this Lua
+-- state for another profile (validation loads every pack's) never re-captions
+-- a game that has not selected it, such as a non-Female game.
+local function pack_line(path, profile)
+    if not profile or type(profile.npc_bank) ~= "string" then return nil end
+    local bank = load_bank(profile.npc_bank)
+    return bank and bank.lines[path] or nil
+end
+
+-- The engine collection loads every listed item; with max_count 0 an item is
+-- exactly one file. These lists reproduce the engine's own expansion
+-- (exact file, then numbers 0..max-1, no gap stop) with pack members swapped in.
+local function engine_items(prefix, max_count)
+    local items = {}
+    if sound_exists(prefix) then items[#items + 1] = prefix end
+    for n = 0, max_count - 1 do if sound_exists(prefix .. n) then items[#items + 1] = prefix .. n end end
+    return items
+end
+
+local function set_items(set, max_count)
+    if set.single then
+        local items = {set.single}
+        for n = 0, max_count - 1 do if sound_exists(set.stock .. n) then items[#items + 1] = set.stock .. n end end
+        return items
+    end
+    local items = {}
+    if sound_exists(set.stock) then items[#items + 1] = set.stock end
+    for n = 0, max_count - 1 do
+        local target = set.paths[n] or set.extra[n]
+        if not target and sound_exists(set.stock .. n) then target = set.stock .. n end
+        if target then items[#items + 1] = target end
+    end
+    return items
+end
+
+local function active_profile()
+    if restoring_native then return nil end
+    return gcs_identity.profile("dialogue")
+end
+
+function validate_profile(profile)
+    if profile.type~="dialogue" then return true end
+    for key, target in pairs(profile.routes or {}) do
+        if type(key)~="string" or type(target)~="string" or target=="" then
+            return false,"NPC audio routes require nonempty string keys and targets"
+        end
+        local native=key:match("^native:(.+)$")
+        if native then
+            if not target:match("^[%w_.%-]+$") then return false,"Unsafe native audio alias: "..target end
+            if not gcs_registry.resource_exists("sounds","characters_voice\\dialogs\\"..target..".ogg") then
+                return false,"Missing native audio recording: "..target
+            end
+        else
+            local path=norm(target)
+            if path:match("^\\") or path:find(":",1,true) or path:find("..",1,true)
+                or path:find("[\r\n,]") or path:match("%.ogg$") then
+                return false,"NPC audio collection must be a relative extensionless sound path: "..target
+            end
+            local found=false
+            for _,suffix in ipairs({".ogg","0.ogg","1.ogg"}) do
+                if gcs_registry.resource_exists("sounds",path..suffix) then found=true; break end
+            end
+            if not found then return false,"Missing NPC audio collection: "..target end
+        end
+    end
+    if profile.npc_bank_scope~=nil and profile.npc_bank_scope~="addressed" and profile.npc_bank_scope~="all" then
+        return false,"npc_bank_scope must be addressed or all"
+    end
+    if profile.npc_bank~=nil then
+        local loaded,why=load_bank(profile.npc_bank)
+        if not loaded then return false,why end
+    end
+    return true
+end
+
+local function bank(profile)
+    if not profile then return nil end
+    return profile.audio_source or profile.text_source or "text_only"
+end
+
+function register_native(profile_id, original_id, alias_id, speaker)
+    assert(type(profile_id)=="string" and type(original_id)=="string", "GCS audio profile/string ID required")
+    assert(type(alias_id)=="string" and alias_id:match("^[%w_.%-]+$"), "GCS native audio alias must be a safe asset ID")
+    native_by_profile[profile_id] = native_by_profile[profile_id] or {}
+    aliases_by_profile[profile_id] = aliases_by_profile[profile_id] or {}
+    assert(not native_by_profile[profile_id][original_id], "Duplicate GCS native audio mapping")
+    native_by_profile[profile_id][original_id] = {alias=alias_id, speaker=speaker}
+    aliases_by_profile[profile_id][alias_id] = original_id
+end
+
+function native_id(original_id, profile, speaker)
+    if not profile then return original_id end
+    local rows = native_by_profile[profile.id]
+    local row = rows and rows[original_id]
+    local speaker_data = row and row.speaker and speaker and gcs_registry.npc_data(alife_object(speaker:id()))
+    if row and (not row.speaker or (speaker_data and speaker_data.specific_character==row.speaker)) then return row.alias end
+    -- Declarative custom profile routes: native:<original string ID> = authored alias ID.
+    local alias = profile.routes and profile.routes["native:"..original_id]
+    if type(alias)=="string" and alias:match("^[%w_.%-]+$") then return alias end
+    return original_id
+end
+
+function aliases(profile)
+    if not profile then return {} end
+    local result = {}
+    for alias, original in pairs(aliases_by_profile[profile.id] or {}) do result[alias]=original end
+    for key, alias in pairs(profile.routes or {}) do
+        local original = key:match("^native:(.+)$")
+        if original and type(alias)=="string" and alias:match("^[%w_.%-]+$") then result[alias]=original end
+    end
+    return result
+end
+
+-- Explicit routes can name a custom collection under $game_sounds$.
+-- Missing custom authored speech falls back to the existing-silence collection.
+function route_path(original, profile, actor_addressed)
+    local full = norm(original)
+    local collection = data().series[full]
+    if profile and collection and actor_addressed and profile.routes and profile.routes[full] then return profile.routes[full] end
+    -- Exact pack members (for example a trader's chosen file) and single files.
+    local packed = bank_routes(profile, actor_addressed)
+    local member = packed and (packed.members[full] or (packed.sets[full] and packed.sets[full].single))
+    if member then return member end
+    if not profile or not collection then return original end
+    local selected = actor_addressed and bank(profile) or "gcs_male"
+    return collection[selected] or collection.text_only or original
+end
+
+local function actor_target(npc)
+    local enemy = npc:best_enemy()
+    return enemy and db.actor and enemy:id()==db.actor:id()
+end
+
+local function actor_theme(theme, npc, full)
+    if theme.section:match("^meet_") then return true end
+    -- Match audited sound-theme declarations, not every sound below scenario/.
+    local known = data().series[norm(full)]
+    if not known then
+        local profile = active_profile()
+        local packed = profile and type(profile.npc_bank) == "string" and load_bank(profile.npc_bank)
+        known = packed and packed.sets[norm(full)]
+    end
+    if data().scenario_sections[theme.section] and known then return true end
+    -- Combat themes only change when their actual target is the actor.
+    if theme.section=="fight_attack" then return actor_target(npc) end
+    if theme.section=="help_thanks" then
+        return helped_by_actor[npc:id()] and time_global()<helped_by_actor[npc:id()]
+    end
+    -- Healing may be performed by another NPC; do not infer its addressee.
+    return false
+end
+
+local function original_theme_path(theme, npc)
+    return (theme.prefix==false and "characters_voice\\" or npc:sound_prefix()) .. theme.path
+end
+
+-- Register the stock collection through the original method (its IDs, flags
+-- and prefix handling), then replace it with the pack set's exact file list.
+local function register_pack_theme(original_init, theme, npc, set)
+    local prefix_before = npc:sound_prefix()
+    local result = pack(original_init(theme, npc))
+    local npc_id = npc:id()
+    theme.npc = theme.npc or {}
+    theme.sound_path = theme.sound_path or {}
+    local entry, created = theme.npc[npc_id], false
+    if entry then
+        npc:remove_sound(entry.id)
+    else
+        if not (sound_theme and sound_theme.id) then return unpack(result,1,result.n) end
+        entry, created = {id=sound_theme.id()}, true
+        theme.npc[npc_id] = entry
+        npc:sound_prefix(prefix_before)
+    end
+    local old_prefix = npc:sound_prefix()
+    npc:sound_prefix("")
+    local registered
+    if theme.is_combat_sound then
+        registered = pack(pcall(npc.add_combat_sound,npc,set.theme_list,0,snd_type.talk,2,1,entry.id,"bip01_head"))
+    else
+        registered = pack(pcall(npc.add_sound,npc,set.theme_list,0,snd_type.talk,2,1,entry.id))
+    end
+    npc:sound_prefix(old_prefix)
+    if not registered[1] then error(registered[2]) end
+    entry.max = (tonumber(registered[2]) or 0) - 1
+    local paths = {}
+    for n, path in ipairs(set.theme_paths) do paths[n] = path end
+    theme.sound_path[npc_id] = paths
+    if created then
+        if theme.group_snd then theme.can_play_group_sound = true end
+        if sound_theme.can_play_sound then sound_theme.can_play_sound[npc_id] = true end
+    end
+    return unpack(result,1,result.n)
+end
+
+local function initialize_theme(original_init, theme, npc)
+    local original = original_theme_path(theme, npc)
+    local profile = active_profile()
+    local addressed = actor_theme(theme,npc,original)
+    local set = theme_set(route_set(original, profile, addressed))
+    theme._gcs_routes = theme._gcs_routes or {}
+    if set and not set.single then
+        theme._gcs_routes[npc:id()] = set.key
+        return register_pack_theme(original_init, theme, npc, set)
+    end
+    local routed = set and set.single or route_path(original, profile, addressed)
+    theme._gcs_routes[npc:id()] = routed
+    if norm(routed)==norm(original) then return original_init(theme,npc) end
+    local old_prefix, old_path, old_flag = npc:sound_prefix(), theme.path, theme.prefix
+    npc:sound_prefix("")
+    theme.path, theme.prefix = routed, true
+    local result = pack(pcall(original_init,theme,npc))
+    theme.path, theme.prefix = old_path, old_flag
+    npc:sound_prefix(old_prefix)
+    if not result[1] then error(result[2]) end
+    return unpack(result,2,result.n)
+end
+
+local function held_key(theme,npc_id) return theme.section..":"..tostring(npc_id) end
+
+local function update_native(npc)
+    if not npc or not npc:alive() then return end
+    local id, profile = npc:id(), active_profile()
+    local previous = native_state[id]
+    if not profile and not previous then return end
+    if not npc.add_combat_sound then return end
+    if not previous then previous={paths={}}; native_state[id]=previous end
+    -- game_object userdata has no __eq operator, and the same native NPC can
+    -- arrive through different Lua wrappers. Its numeric ID is stable between
+    -- spawn/destroy boundaries; keep the newest wrapper for profile refreshes.
+    previous.object=npc
+    local prefix = npc:sound_prefix()
+    local target_actor = actor_target(npc)
+    local actor_hit=hit_by_actor[id] and time_global()<hit_by_actor[id] or false
+    local context=prefix..":"..tostring(profile and profile.id)..":"..tostring(profile and profile.revision)
+        ..":"..tostring(bank(profile))..":"..tostring(target_actor and true or false)..":"..tostring(actor_hit)
+    if previous.context==context then return end
+    local ini = system_ini()
+    local section = npc:section()
+    local head = ini:r_string_ex(section,"bone_head") or "bip01_head"
+    for _, registration in ipairs(data().native) do
+        local source = ini:r_string_ex(section, registration.key)
+        if source and source~="" then
+            local addressed = (registration.actor_target and target_actor)
+                or (registration.hit_actor and hit_by_actor[id] and time_global()<hit_by_actor[id])
+            local pieces, changed, relevant = {}, false, false
+            local fragments, explicit = {}, false
+            for fragment in source:gmatch("[^,]+") do
+                fragment = fragment:match("^%s*(.-)%s*$")
+                local full = prefix..fragment
+                local set = route_set(full,profile,addressed)
+                fragments[#fragments+1] = {full=full, set=set}
+                if set then explicit=true end
+            end
+            local count = registration.count
+            if explicit then
+                -- A pack set mixes folders, so list every engine item exactly.
+                for _, item in ipairs(fragments) do
+                    local items = item.set and set_items(item.set,registration.count) or engine_items(norm(item.full),registration.count)
+                    for _, path in ipairs(items) do pieces[#pieces+1] = path end
+                end
+                count, changed, relevant = 0, true, true
+            else
+                for _, item in ipairs(fragments) do
+                    local routed = route_path(item.full,profile,addressed)
+                    pieces[#pieces+1] = routed
+                    if data().series[norm(item.full)] then relevant=true end
+                    if norm(routed)~=norm(item.full) then changed=true end
+                end
+            end
+            local desired = table.concat(pieces,",")
+            if relevant and previous.paths[registration.id]~=desired and (changed or previous.paths[registration.id]) then
+                -- Same engine category, type, priority, mask, head bone and user-data kind.
+                -- The speaker prefix is changed only for this synchronous registration.
+                npc:remove_sound(registration.id)
+                npc:sound_prefix("")
+                local method = registration.combat and npc.add_combat_sound or npc.add_sound
+                local result = pack(pcall(method,npc,desired,count,snd_type[registration.type],
+                    registration.priority,registration.mask,registration.id,head))
+                npc:sound_prefix(prefix)
+                if not result[1] then error(result[2]) end
+                previous.paths[registration.id] = desired
+            end
+        end
+    end
+    previous.context=context
+end
+
+function refresh()
+    for _, state in pairs(native_state) do update_native(state.object) end
+end
+
+local function npc_destroy(npc)
+    native_state[npc:id()]=nil
+    hit_by_actor[npc:id()]=nil
+    helped_by_actor[npc:id()]=nil
+end
+
+local function npc_spawn(npc)
+    -- IDs may be reused after a native transition. Start registration ownership
+    -- afresh on spawn even if the previous world's destroy was not observed.
+    -- Retain help timers restored by load_state before this spawn callback.
+    native_state[npc:id()]=nil
+    update_native(npc)
+end
+
+local function npc_hit(npc,amount,direction,who)
+    hit_by_actor[npc:id()] = who and db.actor and who:id()==db.actor:id() and time_global()+1500 or nil
+    update_native(npc)
+end
+
+local function before_hit(npc,hit)
+    npc_hit(npc,nil,nil,hit and hit.draftsman)
+end
+
+local function save_state(state)
+    local remaining = {}
+    for key, deadline in pairs(held) do
+        if deadline>time_global() then remaining[key]=deadline-time_global() end
+    end
+    state.gcs_npc_audio = remaining
+    local help_remaining={}
+    for id,deadline in pairs(helped_by_actor) do
+        if deadline>time_global() then help_remaining[id]=deadline-time_global() end
+    end
+    state.gcs_npc_audio_help=help_remaining
+end
+
+local function load_state(state)
+    held={}
+    for key, remaining in pairs(state.gcs_npc_audio or {}) do held[key]=time_global()+remaining end
+    hit_by_actor={}
+    helped_by_actor={}
+    for id,remaining in pairs(state.gcs_npc_audio_help or {}) do helped_by_actor[id]=time_global()+remaining end
+end
+
+function reset_for_load()
+    -- Restore old live objects before forgetting owned registry paths. A same-map
+    -- QuickLoad may keep an object, while another world may reuse its numeric ID.
+    restoring_native=true
+    for _,state in pairs(native_state) do pcall(update_native,state.object) end
+    restoring_native=false
+    native_state={}
+    held, helped_by_actor, hit_by_actor = {}, {}, {}
+    scoped_actor_help, scoped_trader = false, nil
+end
+
+function install()
+    if installed then return end
+    installed=true
+    local class = sound_theme.npc_sound
+    local init = class.init_npc
+    class.init_npc = function(self,npc) return initialize_theme(init,self,npc) end
+    local play = class.play
+    class.play = function(self,npc_id,...)
+        local storage = db.storage[npc_id]
+        local npc = storage and storage.object
+        if npc then
+            local full=original_theme_path(self,npc)
+            local profile=active_profile()
+            local addressed=actor_theme(self,npc,full)
+            local set=theme_set(route_set(full,profile,addressed))
+            local desired=set and (set.single or set.key) or route_path(full,profile,addressed)
+            local old=self._gcs_routes and self._gcs_routes[npc_id]
+            if old and norm(old)~=norm(desired) then
+                if self.npc[npc_id] then npc:remove_sound(self.npc[npc_id].id); self.npc[npc_id]=nil end
+                initialize_theme(init,self,npc)
+            end
+        end
+        local result=pack(play(self,npc_id,...))
+        if result[1] then
+            local path=self.sound_path[npc_id] and self.sound_path[npc_id][(self.played_id or -1)+1]
+            local meta=path and data().lines[norm(path)]
+            if meta and meta.silent then
+                held[held_key(self,npc_id)] = time_global()+(tonumber(self.delay_sound) or 0)+meta.duration_ms
+            end
+        end
+        return unpack(result,1,result.n)
+    end
+    local playing=class.is_playing
+    class.is_playing = function(self,npc_id)
+        local deadline=held[held_key(self,npc_id)]
+        if deadline and time_global()<deadline then return true end
+        held[held_key(self,npc_id)]=nil
+        return playing(self,npc_id)
+    end
+    for _, key in ipairs({"reset","stop"}) do
+        local original=class[key]
+        class[key]=function(self,npc_id,...)
+            held[held_key(self,npc_id)]=nil
+            return original(self,npc_id,...)
+        end
+    end
+    local caption=closecaption.sound
+    closecaption.sound=function(path,duration,...)
+        local meta=data().lines[norm(path)]
+        if meta then return caption(meta.original,meta.duration_ms,...) end
+        -- Pack members caption as the stock line they stand in for.
+        local original=pack_line(norm(path),active_profile())
+        if original then return caption(original,duration,...) end
+        return caption(path,duration,...)
+    end
+    -- Legacy animated traders select exact files outside sound_theme. Keep their
+    -- random selection and animation callbacks, routing only inside reset_scheme.
+    local trader_class=mob_trader.mob_trader
+    local trader_reset=trader_class.reset_scheme
+    trader_class.reset_scheme=function(self,...)
+        self._gcs_audio_until=nil
+        held["mob:"..tostring(self.object:id())]=nil
+        local previous=scoped_trader
+        scoped_trader=self
+        local result=pack(pcall(trader_reset,self,...))
+        scoped_trader=previous
+        if not result[1] then error(result[2]) end
+        return unpack(result,2,result.n)
+    end
+    local pick=mob_sound.pick_sound_from_set
+    mob_sound.pick_sound_from_set=function(set,...)
+        local path=pick(set,...)
+        if not scoped_trader or not path then return path end
+        local routed=route_path(path,active_profile(),true)
+        local meta=data().lines[norm(routed)]
+        if meta and meta.silent then
+            scoped_trader._gcs_audio_until=time_global()+meta.duration_ms
+            held["mob:"..tostring(scoped_trader.object:id())]=scoped_trader._gcs_audio_until
+        end
+        return routed
+    end
+    local trader_end=trader_class.on_sound_end
+    trader_class.on_sound_end=function(self,...)
+        local key="mob:"..tostring(self.object:id())
+        local deadline=self._gcs_audio_until or held[key]
+        if deadline and time_global()<deadline then
+            self._gcs_audio_until=deadline
+            local args=pack(...)
+            CreateTimeEvent("gcs_npc_audio_trader",self.object:id(),(deadline-time_global())/1000,function()
+                if self._gcs_audio_until==deadline then
+                    self._gcs_audio_until=nil
+                    held[key]=nil
+                    trader_end(self,unpack(args,1,args.n))
+                end
+                return true
+            end)
+            return
+        end
+        self._gcs_audio_until=nil
+        held[key]=nil
+        return trader_end(self,...)
+    end
+    local trader_deactivate=trader_class.deactivate
+    trader_class.deactivate=function(self,...)
+        self._gcs_audio_until=nil
+        held["mob:"..tostring(self.object:id())]=nil
+        return trader_deactivate(self,...)
+    end
+    -- Record an actual actor healing action, distinguishing it from NPC medics.
+    local unlock=xr_wounded.unlock_medkit
+    xr_wounded.unlock_medkit=function(npc,...)
+        helped_by_actor[npc:id()] = scoped_actor_help and time_global()+60000 or nil
+        return unlock(npc,...)
+    end
+    local function actor_help_wrapper(owner,key)
+        local original=owner and owner[key]
+        if type(original)~="function" then return end
+        owner[key]=function(...)
+            local previous=scoped_actor_help
+            scoped_actor_help=true
+            local result=pack(pcall(original,...))
+            scoped_actor_help=previous
+            if not result[1] then error(result[2]) end
+            return unpack(result,2,result.n)
+        end
+    end
+    actor_help_wrapper(dialogs,"transfer_medkit")
+    actor_help_wrapper(dialogs,"transfer_medkit_to_hip")
+    actor_help_wrapper(ui_hud_dotmarks,"help_wounded_stalker")
+    RegisterScriptCallback("npc_on_net_spawn",npc_spawn)
+    RegisterScriptCallback("npc_on_update",update_native)
+    RegisterScriptCallback("npc_on_net_destroy",npc_destroy)
+    RegisterScriptCallback("npc_on_hit_callback",npc_hit)
+    RegisterScriptCallback("npc_on_before_hit",before_hit)
+    RegisterScriptCallback("save_state",save_state)
+    RegisterScriptCallback("load_state",load_state)
+end
+
+function on_game_start() install() end

@@ -1,0 +1,548 @@
+-- GAMMA Character Selector: Azazel adapter. All persisted state is plain data.
+-- The four hooks in gamemode_azazel deliberately leave its gameplay algorithm intact.
+local pending
+local installed = false
+local before_save_wrapper
+local after_save_wrapper
+local dispatching = 0
+local rebuild_owed = false
+local serial = 0
+local presentation_checked, presentation_generation = {}, nil
+local input_owned = false
+local last_poll = 0
+local EFFECT_ID = 210412
+local SETTLE_MS = 750
+local TIMEOUT_MS = 15000
+-- Phases in which a transfer is genuinely under way. Each one ends on its own:
+-- "preparing" when the death callback that started it returns, the others
+-- through update() (complete, failed after TIMEOUT_MS) or the VM reset of the
+-- load they lead to. "failed" and "complete" are deliberately absent.
+local IN_FLIGHT = {
+    preparing = true, settling = true, cross_map = true,
+    saving = true, reconnect = true, loading = true,
+}
+
+local function pack(...)
+    return {n = select("#", ...), ...}
+end
+
+local function now()
+    return time_global()
+end
+
+local function log(message)
+    printf("[GCS Azazel] %s", tostring(message))
+end
+
+-- The HUD shows only the translated text, so a player never sees the English
+-- developer reason; the log gets the string ID and that reason.
+local function message(id, detail)
+    log(id .. ((detail and detail ~= "") and (": " .. tostring(detail)) or ""))
+    if actor_menu and actor_menu.set_msg then actor_menu.set_msg(1, game.translate_string(id), 15) end
+end
+
+local function base_name(filename)
+    return tostring(filename or ""):gsub("\\", "/"):match("([^/]+)$")
+end
+
+local function save_name(filename)
+    local name = base_name(filename)
+    return name and name:gsub("%.[sS][cC][oO][pPcC]$", ""):lower()
+end
+
+local function save_path(slot, extension)
+    return getFS():update_path("$game_saves$", "") .. slot .. extension
+end
+
+local function exists(slot)
+    return getFS():exist("$game_saves$", slot .. ".scop")
+        or getFS():exist("$game_saves$", slot .. ".scoc")
+end
+
+local function unique_slot(life)
+    -- No user-authored text enters a console command or a generated save path.
+    local stamp = os.date("%Y%m%d_%H%M%S")
+    local name
+    repeat
+        serial = serial + 1
+        name = string.format("gcs_azazel_%s_%d_%d", stamp, tonumber(life) or 0, serial)
+    until not exists(name)
+    return name
+end
+
+local function lock_transition()
+    if input_owned then return end
+    hide_hud_all()
+    input_owned = true
+    level.add_pp_effector("sleep_fade.ppe", EFFECT_ID, false)
+end
+
+local function unlock_transition()
+    if not input_owned then return end
+    level.remove_pp_effector(EFFECT_ID)
+    input_owned = false
+end
+
+-- Own callback flags instead of globally enabling input another mod disabled.
+local function key_input(_, _, _, flags)
+    if input_owned then flags.ret_value = false end
+end
+
+local function mouse_input(_, _, _, flags)
+    if input_owned then flags.ret_value = true end
+end
+
+local function save_input(flags)
+    if input_owned then flags.ret = true end
+end
+
+local function load_input(_, _, flags)
+    if input_owned then flags.ret = true end
+end
+
+-- Phases in which possession has completed and only the checkpoint is left:
+-- settling exists only to make the checkpoint consistent (update() finishes a
+-- transfer that needs none), and saving, reconnect and loading are the
+-- checkpoint. A failure in any other phase ("preparing", "cross_map") stopped
+-- the transfer itself, so its message must not claim the transfer finished.
+local CHECKPOINT_PHASES = {settling = true, saving = true, reconnect = true, loading = true}
+
+-- No phase changes pSettings after prepare applied the possessed life, so a
+-- failure has no presentation to restore: this world keeps the possessed life.
+local function fail(reason)
+    local id = "gcs_azazel_transfer_incomplete"
+    if pending then
+        if CHECKPOINT_PHASES[pending.phase] then id = "gcs_azazel_checkpoint_failed" end
+        -- pSettings may hold the new presentation while native objects were
+        -- never rebuilt; the next transfer must checkpoint even on equal signatures.
+        if pending.rebuild then rebuild_owed = true end
+        pending.phase = "failed"
+        pending.error = tostring(reason)
+    end
+    unlock_transition()
+    message(id, reason)
+end
+
+local function current_matches(token)
+    local identity = gcs_identity.current()
+    return identity and identity.token == token
+end
+
+-- True only while this life's transfer is under way. A failed or rejected
+-- transfer is not in flight: it neither vetoes deaths nor blocks candidates,
+-- so the next death behaves exactly as it would with no transfer behind it.
+local function in_flight()
+    if not pending or not IN_FLIGHT[pending.phase] then return false end
+    if pending.phase == "preparing" and dispatching == 0 then return false end
+    return current_matches(pending.token) and true or false
+end
+
+-- The signature of what pSettings holds now (nil at baseline).
+local function applied_signature()
+    local active = gcs_presentation.current and gcs_presentation.current()
+    if active then return (gcs_presentation.signature(active)) end
+end
+
+-- Public to make external progress/debug UIs possible without transferring again.
+function status()
+    if not pending then return nil end
+    return {
+        token = pending.token, phase = pending.phase, slot = pending.slot,
+        gender = pending.gender, rebuild = pending.rebuild, error = pending.error,
+    }
+end
+
+function eligible(se_obj)
+    -- Installation does not migrate or change Azazel selection on unmanaged saves.
+    if not gcs_identity.current() then return true end
+    if in_flight() then return false end
+    local gender = gcs_registry.resolve_npc(se_obj)
+    if not gender then return false end
+    -- Resolved genders are detached snapshots. Cache by their stable ID only
+    -- within the registry generation that validated those definitions.
+    local generation = gcs_registry.generation()
+    if generation ~= presentation_generation then
+        presentation_checked, presentation_generation = {}, generation
+    end
+    if not presentation_checked[gender.id] then
+        local signature = gcs_presentation.signature(gender)
+        if type(signature)~="string" or signature=="" then return false end
+        presentation_checked[gender.id]=true
+    end
+    local portrait=se_obj:character_icon()
+    if portrait and gcs_registry.portrait_exists(portrait) then return true end
+    for _, entry in ipairs(gcs_registry.pool(gender.id,se_obj:community()) or {}) do
+        local icon=type(entry)=="table" and entry.id or entry
+        if gcs_registry.portrait_exists(icon) then return true end
+    end
+    return false
+end
+
+local function npc_portrait(se_obj, gender, faction)
+    local portrait = se_obj:character_icon()
+    if portrait and gcs_registry.portrait_exists(portrait) then return portrait end
+    local pool = gcs_registry.pool(gender.id, faction)
+    if pool and #pool > 0 then
+        local entry = pool[math.random(#pool)]
+        return type(entry) == "table" and entry.id or entry
+    end
+    return "ui_inGame2_no_data"
+end
+
+function prepare(se_obj)
+    if not gcs_identity.current() then return true end
+    local gender, reason, source = gcs_registry.resolve_npc(se_obj)
+    -- A repeated call within one transfer must not commit a second identity.
+    -- A failed transfer is over, so its target may be possessed afresh.
+    if pending and pending.phase ~= "failed" and pending.target == se_obj.id
+        and current_matches(pending.token) then
+        return true
+    end
+
+    local identity = gcs_identity.current()
+    local previous = gcs_identity.gender()
+    local previous_signature
+    if gcs_identity.pending_error() then
+        -- A refused identity's world runs on stock (gcs_identity.gender() is
+        -- nil); its stored signature names a presentation never applied, so
+        -- possessing an NPC of the saved gender still rebuilds.
+        previous_signature = applied_signature() or "stock"
+    else
+        previous_signature = identity.presentation_signature
+            or applied_signature()
+            or (previous and gcs_presentation.signature(previous))
+    end
+    local target_signature, signature_error
+    if gender then target_signature,signature_error=gcs_presentation.signature(gender)
+    else signature_error=reason or "NPC gender registration disappeared" end
+    local function reject(problem)
+        -- The old corpse already exists at this seam. Keep its gear and the old
+        -- identity; stop before copying NPC identity/equipment or releasing the NPC.
+        -- A refused identity (previous nil) keeps its world at stock: undo an
+        -- apply that succeeded before possess failed, so the next possession
+        -- compares against stock and rebuilds.
+        if previous then pcall(gcs_presentation.apply,previous) else pcall(gcs_presentation.baseline) end
+        pending={token=identity.token,target=se_obj.id,gender=identity.gender,
+            phase="failed",rebuild=false,error=tostring(problem),failure_stage="preparation"}
+        local text=game.translate_string("gcs_azazel_transfer_failed")
+        if text=="gcs_azazel_transfer_failed" then text="Character transfer stopped. Load an earlier save; the former character's gear remains in its corpse." end
+        -- As in message(): the HUD shows the translated text, the log the reason.
+        log("gcs_azazel_transfer_failed: "..tostring(problem))
+        actor_menu.set_msg(1,text,20)
+        return false
+    end
+    if type(previous_signature)~="string" or type(target_signature)~="string" then
+        return reject(signature_error or "presentation signature unavailable")
+    end
+    local faction = se_obj:community()
+    local data = gcs_registry.npc_data(se_obj) or {}
+    serial = serial + 1
+    local token = string.format("%s:%d:%d:%d", os.date("%Y%m%d%H%M%S"),
+        now(), se_obj.id, serial)
+    local destination = alife():level_name(game_graph():vertex(se_obj.m_game_vertex_id):level_id())
+    pending = {
+        token = token, target = se_obj.id, gender = gender.id,
+        source = source or data.specific_character,
+        portrait = npc_portrait(se_obj, gender, faction),
+        destination = destination,
+        cross_map = destination ~= level.name(),
+        rebuild = previous_signature ~= target_signature or rebuild_owed,
+        phase = "preparing", started = now(),
+    }
+
+    -- Called only after the former actor's corpse/visual/inventory have been recorded.
+    -- Every new outfit server object is constructed against the new configuration.
+    if not gcs_registry.portrait_exists(pending.portrait) then return reject("possession portrait is unavailable") end
+    local call_ok, applied, apply_error = pcall(gcs_presentation.apply,gender)
+    if not call_ok or applied~=true then return reject(apply_error or applied) end
+    local ok, possessed, identity_error = pcall(gcs_identity.possess,gender.id,pending.portrait,faction,pending.source,token)
+    if not ok or possessed~=true then return reject(identity_error or possessed) end
+    log("prepared " .. token .. " -> " .. gender.id .. (pending.rebuild and " (presentation rebuild)" or ""))
+    return true
+end
+
+local function inventory_snapshot()
+    local online = {}
+    local parts = {}
+    db.actor:iterate_inventory(function(_, item)
+        online[item:id()] = true
+        parts[#parts + 1] = tostring(item:id()) .. ":" .. item:section()
+    end, nil)
+    table.sort(parts)
+    -- Include slots because inventory insertion precedes automatic equipment placement.
+    for slot = 0, 16 do
+        local item = db.actor:item_in_slot(slot)
+        parts[#parts + 1] = tostring(slot) .. "=" .. (item and tostring(item:id()) or "-")
+    end
+    return online, table.concat(parts, ";")
+end
+
+local function expected_inventory()
+    local ids = {}
+    local sim = alife()
+    local actor_id = db.actor:id()
+    for id = 1, 65534 do
+        local item = sim:object(id)
+        if item and item.parent_id == actor_id then ids[id] = true end
+    end
+    return ids
+end
+
+local function inventory_ready(online)
+    for id in pairs(pending.expected or {}) do
+        local item = alife_object(id)
+        -- Items legitimately consumed/replaced by callbacks do not block a checkpoint.
+        if item and item.parent_id == db.actor:id() and not online[id] then return false end
+    end
+    local processor = itms_manager.get_item_processor()
+    for _, key in ipairs({"Cond", "Uses", "Ammo"}) do
+        for id in pairs(processor[key] or {}) do
+            local item = alife_object(id)
+            if item and item.parent_id == db.actor:id() then return false end
+        end
+    end
+    return true
+end
+
+function complete(se_obj, destination)
+    if not pending or pending.phase ~= "preparing" then return end
+    if not current_matches(pending.token) then
+        fail("identity changed before possession completed")
+        return
+    end
+    -- Baseline copies the NPC icon directly; retain our validated fallback if needed.
+    if db.actor_binder then db.actor_binder.character_icon = pending.portrait end
+    db.actor:set_character_icon(pending.portrait)
+    pending.phase = pending.cross_map and "cross_map" or "settling"
+    pending.expected = expected_inventory()
+    pending.started = now()
+    pending.stable_since = now()
+    pending.last_inventory = nil
+    if not pending.cross_map then lock_transition() end
+    -- The baseline already queued its cross-map ChangeLevel; no extra save/load here.
+end
+
+local function update_server_visual()
+    if not pending or not current_matches(pending.token) then return end
+    if not pending.rebuild then return end
+    local gender = gcs_identity.gender()
+    local actor = alife():actor()
+    local data = utils_stpk.get_actor_data(actor)
+    assert(data, "GCS Azazel could not read actor spawn packet")
+    -- nil: Male keeps the packet's body (gcs_presentation.server_visual).
+    local visual = gcs_presentation.server_visual(gender, data.visual_name)
+    assert(visual ~= "", "GCS Azazel has no registered no-outfit visual")
+    if visual and data.visual_name ~= visual then
+        -- Retain every unrelated packet field, including live name/faction/rank.
+        data.visual_name = visual
+        utils_stpk.set_actor_data(data, actor)
+    end
+end
+
+local function read_file(path)
+    local file = io.open(path, "rb")
+    if not file then return nil end
+    local data = file:read("*all")
+    file:close()
+    return data
+end
+
+-- Invoked after the engine closed .scop, never from save_state/before_save.
+function checkpoint_completed(filename)
+    if not pending or pending.phase ~= "saving" or save_name(filename) ~= pending.slot then return end
+    if not current_matches(pending.token) then fail("checkpoint identity changed"); return end
+    local scop = io.open(save_path(pending.slot, ".scop"), "rb")
+    local size = scop and scop:seek("end")
+    if scop then scop:close() end
+    if not size or size < 1 then fail("checkpoint .scop missing or empty"); return end
+    local bytes = read_file(save_path(pending.slot, ".scoc"))
+    if not bytes or bytes == "" then fail("checkpoint .scoc missing or empty"); return end
+    local ok, data = pcall(marshal.decode, bytes)
+    if not ok or type(data) ~= "table" or not data.gcs_identity
+        or data.gcs_identity.token ~= pending.token
+        or not data.gcs_azazel or data.gcs_azazel.token ~= pending.token then
+        fail("checkpoint identity token mismatch")
+        return
+    end
+    local allowed, reason = gcs_identity.preflight(pending.slot)
+    if not allowed then fail(reason or "checkpoint dependency validation failed"); return end
+    pending.phase = "reconnect"
+    log("validated checkpoint " .. pending.slot)
+end
+
+local function start_checkpoint()
+    local identity = gcs_identity.current()
+    if not identity or identity.token ~= pending.token then fail("checkpoint identity changed"); return end
+    pending.slot = unique_slot(identity.life)
+    pending.phase = "saving"
+    pending.started = now()
+    -- Engine save completion is asynchronous; the completion wrapper validates it.
+    local ok, reason = pcall(exec_console_cmd, "save " .. pending.slot)
+    if not ok then fail(reason) end
+end
+
+function retry_checkpoint()
+    if not pending or pending.phase ~= "failed" or not pending.rebuild or pending.cross_map then
+        return false, "No failed same-map presentation checkpoint to retry."
+    end
+    if not current_matches(pending.token) then return false, "The current identity has changed." end
+    pending.phase, pending.error = "settling", nil
+    pending.started, pending.stable_since = now(), now()
+    pending.last_inventory = nil
+    pending.expected = expected_inventory()
+    lock_transition()
+    return true
+end
+
+local function finish_transfer()
+    gcs_identity.notify()
+    pending.phase = "complete"
+    pending = nil
+    unlock_transition()
+end
+
+function update()
+    if not pending or not db.actor or not db.actor:alive() then return end
+    if now() < last_poll + 100 then return end
+    last_poll = now()
+    if pending.phase == "settling" then
+        if now() - pending.started > TIMEOUT_MS then
+            -- Settling makes the checkpoint consistent. A transfer that needs no
+            -- checkpoint is already complete: finish it rather than report a
+            -- checkpoint failure it cannot retry.
+            if pending.rebuild then fail("equipment or NPC release did not finish"); return end
+            log("finished " .. pending.token .. " although equipment or NPC release did not finish")
+            finish_transfer()
+            return
+        end
+        local online, signature = inventory_snapshot()
+        if signature ~= pending.last_inventory then
+            pending.last_inventory, pending.stable_since = signature, now()
+        end
+        local target = alife_object(pending.target)
+        local storage = db.storage[pending.target]
+        if target or (storage and storage.object) or not inventory_ready(online) then
+            pending.stable_since = now()
+            return
+        end
+        if now() - pending.stable_since < SETTLE_MS then return end
+        if pending.rebuild then
+            start_checkpoint()
+        else
+            finish_transfer()
+        end
+    elseif pending.phase == "cross_map" then
+        -- Stock's ChangeLevel runs on the next update and takes effect at once;
+        -- a cross-map transfer still here after the timeout is not in flight.
+        if now() - pending.started > TIMEOUT_MS then fail("engine did not begin the level change") end
+    elseif pending.phase == "saving" then
+        if now() - pending.started > TIMEOUT_MS then fail("engine did not complete the checkpoint") end
+    elseif pending.phase == "reconnect" then
+        local allowed, reason = gcs_identity.preflight(pending.slot)
+        if not allowed then fail(reason); return end
+        -- pSettings keep the possessed life until the reset. The new VM needs
+        -- no stock restore from this one: its load restores every key GCS has
+        -- written from the process record ([gcs_presentation_stock]) before
+        -- identity load_state applies the checkpoint's life.
+        pending.phase = "loading"
+        pending.started = now()
+        -- Full server reconnect tears down actor + level HUD. Plain load may QuickLoad.
+        -- exec_console_cmd returns nothing and the engine defers the disconnect
+        -- and the start (CCC_Start, xr_ioc_cmd.cpp:398-408): only a Lua error
+        -- is visible here. A start that never begins leaves this VM running
+        -- into the loading timeout below; one that fails after the deferred
+        -- disconnect has outlived this VM, and every later start or load
+        -- restores from the record.
+        local command = "start server(" .. pending.slot .. "/single/alife/load) client(localhost)"
+        local ok, problem = pcall(exec_console_cmd, command)
+        if not ok then fail(problem) end
+    elseif pending.phase == "loading" and now() - pending.started > TIMEOUT_MS then
+        fail("engine did not begin loading the validated checkpoint")
+    end
+end
+
+local function save_state(data)
+    if pending and current_matches(pending.token) then
+        data.gcs_azazel = {
+            token = pending.token, phase = pending.phase, slot = pending.slot,
+            gender = pending.gender, rebuild = pending.rebuild,
+        }
+    else
+        data.gcs_azazel = nil
+    end
+end
+
+local function load_state(data)
+    -- Loading a checkpoint completes the transfer. Never replay possession/save commands.
+    unlock_transition()
+    pending = nil
+    rebuild_owed = false
+    last_poll = 0
+end
+
+function reset_for_load()
+    -- Called even if an unmanaged save has no .scoc and emits no load_state callback.
+    unlock_transition()
+    pending = nil
+    rebuild_owed = false
+    last_poll = 0
+end
+
+-- gamemode_azazel.on_game_start registers this function for
+-- actor_on_before_death, so it is the function axr_main stores and calls.
+-- It reads gamemode_azazel.actor_on_before_death at call time, which keeps
+-- every wrapper installed at module load in the chain (GAMMA:
+-- perk_based_artefacts -> mags_patches -> stock).
+function actor_on_before_death(who_id, flags, ...)
+    if in_flight() then
+        -- Survive without entering the chain: no death count, no second
+        -- possession, no wrapper side effects such as complimentary magazines.
+        flags.ret_value = false
+        return
+    end
+    if dispatching == 0 and pending and pending.phase == "preparing" then
+        fail("possession did not complete")
+    end
+    dispatching = dispatching + 1
+    local result = pack(pcall(gamemode_azazel.actor_on_before_death, who_id, flags, ...))
+    dispatching = dispatching - 1
+    if dispatching == 0 and pending and pending.phase == "preparing" then
+        -- Stock stopped between prepare and complete; nothing is in flight.
+        fail("possession did not complete")
+    end
+    if not result[1] then error(result[2], 0) end
+    return unpack(result, 2, result.n)
+end
+
+function install()
+    if installed then return end
+    -- Early menu installation precedes axr_main's module scan. Load the existing
+    -- owner before subscribing to its level_input.on_mouse_move bridge.
+    local engine_callback_owner = callbacks_gameobject
+    installed = true
+    local original_before = alife_storage_manager.CALifeStorageManager_before_save
+    before_save_wrapper = function(filename, ...)
+        update_server_visual()
+        return original_before(filename, ...)
+    end
+    alife_storage_manager.CALifeStorageManager_before_save = before_save_wrapper
+    local original_after = alife_storage_manager.CALifeStorageManager_save
+    after_save_wrapper = function(filename, ...)
+        local result = pack(original_after(filename, ...))
+        checkpoint_completed(filename)
+        return unpack(result, 1, result.n)
+    end
+    alife_storage_manager.CALifeStorageManager_save = after_save_wrapper
+    RegisterScriptCallback("save_state", save_state)
+    RegisterScriptCallback("load_state", load_state)
+    RegisterScriptCallback("actor_on_update", update)
+    RegisterScriptCallback("on_before_key_press", key_input)
+    RegisterScriptCallback("on_before_key_hold", key_input)
+    RegisterScriptCallback("on_before_mouse_move", mouse_input)
+    RegisterScriptCallback("on_before_save_input", save_input)
+    RegisterScriptCallback("on_before_load_input", load_input)
+end
+
+function on_game_start()
+    install()
+end

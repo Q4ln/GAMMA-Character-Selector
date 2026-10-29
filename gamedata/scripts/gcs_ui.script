@@ -1,0 +1,589 @@
+-- GAMMA Character Selector: creation UI only. Identity persistence belongs to
+-- gcs_identity; pools, labels, names and static texture aliases to gcs_registry.
+local PAGE_SIZE = 12
+local PLACEHOLDER = "ui_inGame2_no_data"
+local conflicts_reported = false
+local unavailable_logged, duplicates_checked = {}, false
+local function pack(...) return {n = select("#", ...), ...} end
+
+-- The first available gender in dropdown order; with none available, the
+-- first registered one, so the screen can name what is unavailable.
+local function default_gender()
+    local definitions = gcs_registry and gcs_registry.list_genders and gcs_registry.list_genders() or {}
+    local first = definitions[1]
+    if first ~= nil then return type(first) == "table" and first.id or first end
+    local registered = gcs_registry and gcs_registry.registered_genders and gcs_registry.registered_genders() or {}
+    return registered[1]
+end
+
+local function cancel_creation()
+    if gcs_identity and gcs_identity.cancel_creation then
+        local called, ok, why = pcall(gcs_identity.cancel_creation)
+        if not called or ok == false then printf("[GCS] Creation cancellation failed: %s", tostring(called and why or ok)) end
+    end
+end
+
+local function tr(id)
+    return game.translate_string(id)
+end
+
+local function contains(items, wanted)
+    for i = 1, #(items or {}) do
+        if items[i] == wanted then return true, i end
+    end
+    return false
+end
+
+local function key(ui)
+    return tostring(ui.selected_gender) .. ":" .. tostring(ui.selected_faction or "stalker")
+end
+
+local function remember(ui)
+    ui.gcs_memory = ui.gcs_memory or {}
+    if ui.gcs_pool_key and contains(ui.table_icon, ui.selected_icon) then
+        ui.gcs_memory[ui.gcs_pool_key] = ui.selected_icon
+    end
+end
+
+local function status(ui)
+    -- Keep pack diagnostics in the log; the character panel has no room for a
+    -- technical error dump. Its gender control supplies a short native hint.
+    if ui.gcs_error and ui.gcs_error ~= ui.gcs_logged_error then
+        printf("[GAMMA Character Selector] %s", ui.gcs_error)
+    end
+    ui.gcs_logged_error = ui.gcs_error
+end
+
+-- Native OK box. The main menu's box is reused (as for refused loads) with
+-- its own callback mode cleared; otherwise a private box is created.
+local function show_message(ui, text)
+    printf("[GAMMA Character Selector] %s", tostring(text))
+    local owner = ui and ui.owner
+    local box = owner and owner.message_box
+    if box then
+        owner.mbox_mode, owner.msgbox_id = 0, 0
+    elseif CUIMessageBoxEx then
+        ui.gcs_message_box = ui.gcs_message_box or CUIMessageBoxEx()
+        box = ui.gcs_message_box
+    end
+    if not box then return false end
+    box:InitMessageBox("message_box_ok")
+    box:SetText(text)
+    box:ShowDialog(true)
+    return true
+end
+
+local function refusal_text(ui)
+    local available = gcs_registry and gcs_registry.list_genders and gcs_registry.list_genders() or {}
+    if #available > 0 then return tostring(ui.gcs_error or tr("st_gcs_gender_invalid")) end
+    local lines = {tr("st_gcs_no_gender")}
+    local errors = gcs_registry and gcs_registry.diagnostics and gcs_registry.diagnostics() or {}
+    local ids = {}
+    for id in pairs(errors) do ids[#ids + 1] = id end
+    table.sort(ids)
+    for i = 1, math.min(#ids, 6) do lines[#lines + 1] = tostring(ids[i]) .. ": " .. tostring(errors[ids[i]]) end
+    return table.concat(lines, "\n")
+end
+
+-- Once per Lua state (each main-menu session after a game, load or level
+-- change starts a new one): an incompatible install (for example the old
+-- overwriting LASS Rebase) disables a gender; say so instead of silently
+-- hiding it.
+local function report_conflicts(ui)
+    if conflicts_reported or not (gcs_registry and gcs_registry.package_conflicts) then return end
+    conflicts_reported = true
+    local list = gcs_registry.package_conflicts() or {}
+    if #list == 0 then return end
+    local lines = {tr("st_gcs_package_conflict")}
+    for _, item in ipairs(list) do lines[#lines + 1] = tostring(item.reason) end
+    show_message(ui, table.concat(lines, "\n"))
+end
+
+local function bounds(control)
+    local pos = control:GetWndPos()
+    return {x = pos.x, y = pos.y, width = control:GetWidth(), height = control:GetHeight()}
+end
+
+-- UI coordinates are stretched horizontally by the engine. Contain the
+-- texture's actual atlas crop, including widescreen and square portrait packs.
+function fit_texture(control, texture, box)
+    control:InitTexture(texture or PLACEHOLDER)
+    local rect = control:GetTextureRect()
+    local width, height = rect.x2 - rect.x1, rect.y2 - rect.y1
+    local ratio = utils_xml.screen_ratio()
+    if width <= 0 or height <= 0 then width, height = 123, 87 end
+    local aspect = width / height * ratio
+    local fitted_w = math.min(box.width, box.height * aspect)
+    local fitted_h = fitted_w / aspect
+    control:SetWndPos(vector2():set(box.x + (box.width - fitted_w) / 2, box.y + (box.height - fitted_h) / 2))
+    control:SetWndSize(vector2():set(fitted_w, fitted_h))
+    control:SetStretchTexture(true)
+end
+
+local function update_main_portrait(ui)
+    if not ui.box_icon then return end
+    ui.gcs_icon_bounds = ui.gcs_icon_bounds or bounds(ui.box_icon)
+    fit_texture(ui.box_icon, ui.selected_icon, ui.gcs_icon_bounds)
+end
+
+-- Preserve the native name row, making room for its refresh button. Money is
+-- replaced visually by gender; its nodes remain valid for stock callbacks.
+function on_xml_read(filename, xml, flags)
+    local file = filename:lower():gsub("/", "\\")
+    if file ~= "ui\\ui_mm_faction_select.xml" and file ~= "ui\\ui_mm_faction_select_16.xml" and file ~= "ui\\ui_mm_faction_select_21.xml" then return end
+    -- GAMMA falls back to its base new-game layout above the engine's 1.8
+    -- aspect threshold. Only its actual _16 layout uses the narrower rows.
+    local wide = file:find("_16.xml", 1, true) ~= nil
+    local rows = {
+        cap_name = {x = wide and 155 or 194, y = 284, width = wide and 48 or 61, height = 17},
+        input_name = {x = wide and 207 or 259, y = 285, width = wide and 110 or 137, height = 17},
+    }
+    for node, values in pairs(rows) do
+        local matches = xml:query("main_dialog > " .. node)
+        if matches[1] then xml:setElementAttr(matches[1], values) end
+    end
+    for _, node in ipairs({"cap_money", "text_money"}) do
+        local matches = xml:query("main_dialog > " .. node .. " > text")
+        if matches[1] then xml:setElementAttr(matches[1], {a = 0}) end
+    end
+    if flags then flags.cache = false end
+end
+
+local function valid_gender(id)
+    if not gcs_registry or not gcs_registry.validate_gender then
+        return false, tr("st_gcs_registry_missing")
+    end
+    return gcs_registry.validate_gender(id)
+end
+
+-- A registered gender that fails validation is left out of the dropdown, which
+-- has no room for why. Log each reason once per Lua state instead.
+local function log_unavailable(definitions)
+    if not (gcs_registry and gcs_registry.registered_genders and gcs_registry.diagnostics) then return end
+    local listed, missing = {}, {}
+    for _, definition in ipairs(definitions) do listed[type(definition) == "table" and definition.id or definition] = true end
+    for _, id in ipairs(gcs_registry.registered_genders() or {}) do
+        if not listed[id] then missing[#missing + 1] = id end
+    end
+    -- registered_genders also omits an ID two packs define. Packs register once
+    -- per Lua state, so such duplicates are looked for once.
+    if #missing == 0 and duplicates_checked then return end
+    duplicates_checked = true
+    local errors, conflicts = gcs_registry.diagnostics()
+    errors = errors or {}
+    local duplicates = {}
+    for key in pairs(conflicts or {}) do
+        local id = tostring(key):match("^gender:(.+)$")
+        if id and not listed[id] then duplicates[#duplicates + 1] = id end
+    end
+    table.sort(duplicates)
+    for _, id in ipairs(duplicates) do missing[#missing + 1] = id end
+    for _, id in ipairs(missing) do
+        local text = tostring(id) .. ": " .. tostring(errors[id] or "not valid")
+        if not unavailable_logged[text] then
+            unavailable_logged[text] = true
+            printf("[GAMMA Character Selector] Gender unavailable: %s", text)
+        end
+    end
+end
+
+local function update_gender_control(ui)
+    if not ui.gcs_gender then return end
+    ui.gcs_updating_gender = true
+    ui.gcs_gender:ClearList()
+    ui.gcs_gender_ids = {}
+    local definitions = gcs_registry and gcs_registry.list_genders and gcs_registry.list_genders() or {}
+    log_unavailable(definitions)
+    local current_index, current_label
+    for _, definition in ipairs(definitions) do
+        local id = type(definition) == "table" and definition.id or definition
+        local index = #ui.gcs_gender_ids + 1
+        ui.gcs_gender_ids[index] = id
+        local label = gcs_registry.gender_label and gcs_registry.gender_label(id) or tostring(id)
+        ui.gcs_gender:AddItem(label, index)
+        if id == ui.selected_gender then current_index, current_label = index, label end
+    end
+    if not current_index then
+        current_index = #ui.gcs_gender_ids + 1
+        ui.gcs_gender_ids[current_index] = ui.selected_gender
+        current_label = ui.selected_gender and (tr("st_gcs_unavailable") .. ": " .. tostring(ui.selected_gender)) or tr("st_gcs_unavailable")
+        ui.gcs_gender:AddItem(current_label, current_index)
+    end
+    ui.gcs_gender:SetCurrentIdx(current_index - 1)
+    -- The engine setter selects the list row only; ClearList erased its caption.
+    -- Like GAMMA's stock combos, populate the displayed text separately.
+    ui.gcs_gender:SetText(current_label)
+    ui.gcs_gender:Enable(not ui.gcs_popup_open)
+    ui.gcs_updating_gender = false
+end
+
+-- Restored text stays exact until an explicit gender change. Keep this baseline
+-- separate from generated names so LoadIcon does not reroll an applied preset.
+function restore_name(ui, name)
+    if not ui.character_name then return end
+    ui.character_name:SetText(name or "")
+    ui.gcs_generated_name = nil
+    ui.gcs_restored_name = ui.character_name:GetText()
+end
+
+local function generate_name(ui, force, gender_changed)
+    if not ui.character_name or not ui.selected_gender or not gcs_registry or not gcs_registry.name then return end
+    local current = ui.character_name:GetText()
+    if force or current == "" or current == "Stalker" or current == ui.gcs_generated_name
+        or (gender_changed and current == ui.gcs_restored_name) then
+        local generated = gcs_registry.name(ui.selected_gender, ui.selected_faction)
+        if generated and generated ~= "" then
+            ui.character_name:SetText(generated)
+            ui.gcs_generated_name = generated
+            ui.gcs_restored_name = nil
+        end
+    end
+end
+
+function refresh(ui, wanted, randomize)
+    remember(ui)
+    ui.selected_gender = ui.selected_gender or default_gender()
+    local ok, reason
+    if ui.selected_gender then ok, reason = valid_gender(ui.selected_gender) else ok, reason = false, tr("st_gcs_no_gender") end
+    ui.gcs_error = not ok and (tr("st_gcs_gender_invalid") .. ": " .. tostring(reason or ui.selected_gender)) or nil
+    ui.gcs_notice = nil
+    local items, seen = {}, {}
+    if ok then
+        for _, icon in ipairs(gcs_registry.pool(ui.selected_gender, ui.selected_faction or "stalker") or {}) do
+            if type(icon) == "string" and icon ~= "" and not seen[icon] then
+                items[#items + 1], seen[icon] = icon, true
+            end
+        end
+    end
+    local next_key = key(ui)
+    local same_pool = next_key == ui.gcs_pool_key
+    local candidate = wanted or (same_pool and ui.selected_icon) or (ui.gcs_memory or {})[next_key]
+    if randomize and #items > 0 then candidate = items[math.random(#items)] end
+    if not contains(items, candidate) then
+        if wanted and wanted ~= "" then ui.gcs_notice = tr("st_gcs_portrait_unavailable") end
+        candidate = items[1]
+    end
+    ui.table_icon = items -- public GAMMA/NGT controller contract
+    ui.selected_icon = candidate
+    ui.gcs_pool_key = next_key
+    if ok and #items == 0 then ui.gcs_error = tr("st_gcs_empty_pool") end
+    update_main_portrait(ui)
+    update_gender_control(ui)
+    status(ui)
+    if ui.gcs_popup_open then
+        ui.gcs_pending_icon = candidate
+        ui.gcs_page = 1
+        render_page(ui)
+    end
+    return not ui.gcs_error
+end
+
+function set_gender(ui, id, restore_icon)
+    remember(ui)
+    local previous_gender = ui.selected_gender
+    ui.selected_gender = id or default_gender() -- keep unknown saved IDs visible
+    local ok = refresh(ui, restore_icon)
+    if ok then generate_name(ui, false, ui.selected_gender ~= previous_gender) end
+    return ok
+end
+
+function capture(ui)
+    return {gender = ui.selected_gender or default_gender(), icon = ui.selected_icon, faction = ui.selected_faction}
+end
+
+function apply(ui, data)
+    data = data or {}
+    local gender = data.gender and data.gender ~= "" and data.gender or ui.selected_gender or default_gender()
+    return set_gender(ui, gender, data.icon or data.portrait)
+end
+
+function validate(ui)
+    local ok, reason
+    if ui.selected_gender then ok, reason = valid_gender(ui.selected_gender) else ok, reason = false, tr("st_gcs_no_gender") end
+    if not ok then
+        ui.gcs_error = tr("st_gcs_gender_invalid") .. ": " .. tostring(reason or ui.selected_gender)
+    elseif not contains(gcs_registry.pool(ui.selected_gender, ui.selected_faction) or {}, ui.selected_icon) then
+        ui.gcs_error = tr("st_gcs_empty_pool")
+    else
+        ui.gcs_error = nil
+    end
+    status(ui)
+    return ui.gcs_error == nil
+end
+
+function render_page(ui)
+    if not ui.gcs_popup_open then return end
+    local pages = math.max(1, math.ceil(#ui.table_icon / PAGE_SIZE))
+    ui.gcs_page = math.max(1, math.min(ui.gcs_page or 1, pages))
+    ui.gcs_page_text:SetText(tostring(ui.gcs_page) .. " / " .. tostring(pages) .. "  (" .. tostring(#ui.table_icon) .. ")")
+    ui.gcs_previous:Enable(ui.gcs_page > 1)
+    ui.gcs_next:Enable(ui.gcs_page < pages)
+    for slot = 1, PAGE_SIZE do
+        local index = (ui.gcs_page - 1) * PAGE_SIZE + slot
+        local icon = ui.table_icon[index]
+        local cell = ui.gcs_cells[slot]
+        cell.image:Show(icon ~= nil)
+        cell.button:Show(icon ~= nil)
+        cell.button:Enable(icon ~= nil)
+        cell.frame:Show(icon ~= nil)
+        if icon then
+            -- Never resolve an animated original as a thumbnail fallback.
+            local texture = gcs_registry.thumbnail and gcs_registry.thumbnail(icon) or PLACEHOLDER
+            fit_texture(cell.image, texture, cell.bounds)
+            local selected = icon == ui.gcs_pending_icon
+            cell.frame:SetColor(selected and GetARGB(255, 235, 205, 140) or GetARGB(255, 100, 100, 100))
+        end
+    end
+    local icon = ui.gcs_pending_icon
+    fit_texture(ui.gcs_preview, icon, ui.gcs_preview_bounds)
+    ui.gcs_apply:Enable(icon ~= nil and contains(ui.table_icon, icon))
+end
+
+function show_picker(ui, state, commit)
+    if not ui.gcs_popup then return end
+    if state then
+        if not ui.access or ui.gcs_popup_open then return end
+        refresh(ui)
+        ui.gcs_popup_open = true
+        ui.gcs_pending_icon = ui.selected_icon
+        local _, index = contains(ui.table_icon, ui.selected_icon)
+        ui.gcs_page = math.floor(((index or 1) - 1) / PAGE_SIZE) + 1
+        ui.access = false
+        local label = gcs_registry.gender_label and gcs_registry.gender_label(ui.selected_gender) or tostring(ui.selected_gender)
+        ui.gcs_heading:SetText(tr("st_gcs_portraits") .. " - " .. label .. " / " .. tr("st_faction_" .. tostring(ui.selected_faction)))
+        render_page(ui)
+    else
+        if commit and ui.gcs_popup_open and contains(ui.table_icon, ui.gcs_pending_icon) then
+            ui.selected_icon = ui.gcs_pending_icon
+            remember(ui)
+            ui:UpdateIcon()
+        end
+        ui.gcs_popup_open = false
+        ui.gcs_pending_icon = nil
+        ui.access = true
+        -- Release the live movie/sequence from the hidden preview.
+        ui.gcs_preview:InitTexture(PLACEHOLDER)
+    end
+    ui.gcs_black:Show(state)
+    ui.gcs_popup:Show(state)
+    if ui.gcs_gender then ui.gcs_gender:Enable(not state) end
+end
+
+local function init_main(ui)
+    if ui.gcs_main_initialized then return end
+    ui.gcs_xml = CScriptXmlInit()
+    ui.gcs_xml:ParseFile("gcs_character_selector.xml")
+    local xml = ui.gcs_xml
+    xml:InitStatic("gcs:gender_label", ui.dialog)
+    ui.gcs_gender = xml:InitComboBox("gcs:gender", ui.dialog)
+    ui:Register(ui.gcs_gender, "gcs_gender")
+    ui.gcs_name_refresh = xml:Init3tButton("gcs:name_refresh", ui.dialog)
+    ui:Register(ui.gcs_name_refresh, "gcs_name_refresh")
+    if ui.text_money then ui.text_money:Show(false) end
+    ui.gcs_main_initialized = true
+    refresh(ui)
+    generate_name(ui, false)
+end
+
+local function init_picker(ui)
+    local xml = ui.gcs_xml
+    ui.gcs_black = xml:InitStatic("gcs:popup:black", ui)
+    ui.gcs_popup = xml:InitFrame("gcs:popup:frame", ui)
+    ui.black_2, ui.dialog_2 = ui.gcs_black, ui.gcs_popup
+    ui.gcs_heading = xml:InitTextWnd("gcs:popup:heading", ui.gcs_popup)
+    xml:InitFrame("gcs:popup:preview_frame", ui.gcs_popup)
+    ui.gcs_preview = xml:InitStatic("gcs:popup:preview", ui.gcs_popup)
+    ui.gcs_preview_bounds = bounds(ui.gcs_preview)
+    xml:InitStatic("gcs:popup:preview_label", ui.gcs_popup)
+    ui.gcs_page_text = xml:InitTextWnd("gcs:popup:page", ui.gcs_popup)
+    ui.gcs_previous = xml:Init3tButton("gcs:popup:previous", ui.gcs_popup)
+    ui.gcs_next = xml:Init3tButton("gcs:popup:next", ui.gcs_popup)
+    ui.gcs_apply = xml:Init3tButton("gcs:popup:apply", ui.gcs_popup)
+    ui.gcs_cancel = xml:Init3tButton("gcs:popup:cancel", ui.gcs_popup)
+    ui:Register(ui.gcs_previous, "gcs_previous")
+    ui:Register(ui.gcs_next, "gcs_next")
+    ui:Register(ui.gcs_apply, "gcs_apply")
+    ui:Register(ui.gcs_cancel, "gcs_cancel")
+    ui.gcs_cells = {}
+    local marker = xml:InitStatic("gcs:popup:cell_origin", ui.gcs_popup)
+    local origin = marker:GetWndPos()
+    for slot = 1, PAGE_SIZE do
+        local frame = xml:InitFrame("gcs:popup:cell_frame", ui.gcs_popup)
+        local image = xml:InitStatic("gcs:popup:cell_image", ui.gcs_popup)
+        local button = xml:Init3tButton("gcs:popup:cell_button", ui.gcs_popup)
+        local x = origin.x + ((slot - 1) % 4) * (frame:GetWidth() + 10)
+        local y = origin.y + math.floor((slot - 1) / 4) * (frame:GetHeight() + 12)
+        frame:SetWndPos(vector2():set(x, y))
+        button:SetWndPos(vector2():set(x, y))
+        ui:Register(button, "gcs_cell_" .. slot)
+        ui.gcs_cells[slot] = {image = image, button = button, frame = frame,
+            bounds = {x = x + 3, y = y + 3, width = frame:GetWidth() - 6, height = frame:GetHeight() - 6}}
+    end
+    marker:Show(false)
+    ui.gcs_black:Show(false)
+    ui.gcs_popup:Show(false)
+end
+
+local function picker_callbacks(ui)
+    if ui.gcs_picker_callbacks then return end
+    ui.gcs_picker_callbacks = true
+    for slot = 1, PAGE_SIZE do
+        local index = slot
+        ui:AddCallback("gcs_cell_" .. slot, ui_events.BUTTON_CLICKED, function(self)
+            if not self.gcs_popup_open then return end
+            local icon = self.table_icon[(self.gcs_page - 1) * PAGE_SIZE + index]
+            if icon then self.gcs_pending_icon = icon; render_page(self) end
+        end, ui)
+    end
+    ui:AddCallback("gcs_previous", ui_events.BUTTON_CLICKED, function(self)
+        if self.gcs_popup_open then self.gcs_page = self.gcs_page - 1; render_page(self) end
+    end, ui)
+    ui:AddCallback("gcs_next", ui_events.BUTTON_CLICKED, function(self)
+        if self.gcs_popup_open then self.gcs_page = self.gcs_page + 1; render_page(self) end
+    end, ui)
+    ui:AddCallback("gcs_apply", ui_events.BUTTON_CLICKED, function(self) show_picker(self, false, true) end, ui)
+    ui:AddCallback("gcs_cancel", ui_events.BUTTON_CLICKED, function(self) show_picker(self, false, false) end, ui)
+end
+
+-- Runs at every main_menu_on_init (zzzz_gcs_ui_mcm), that is each time the
+-- engine shows the main menu; the wrappers below are installed once per Lua
+-- state.
+function install()
+    -- A creation still pending when the menu is shown again was never
+    -- consumed: its start failed natively (gcs_identity).
+    if gcs_identity and gcs_identity.discard_unconsumed_creation then
+        local called, ok, why = pcall(gcs_identity.discard_unconsumed_creation)
+        if not called or ok == false then printf("[GCS] Stale creation discard failed: %s", tostring(called and why or ok)) end
+    end
+    local class = ui_mm_faction_select and ui_mm_faction_select.UINewGame
+    if not class or class.GCS_UI_INSTALLED then return end
+    class.GCS_UI_INSTALLED = true
+    RegisterScriptCallback("on_xml_read", on_xml_read)
+    local previous_controls = class.Main_Controls
+    function class.Main_Controls(self, ...)
+        previous_controls(self, ...)
+        init_main(self)
+    end
+    local previous_callbacks = class.Main_CallBacks
+    function class.Main_CallBacks(self, ...)
+        previous_callbacks(self, ...)
+        if self.gcs_main_callbacks then return end
+        self.gcs_main_callbacks = true
+        self:AddCallback("gcs_gender", ui_events.LIST_ITEM_SELECT, function(ui)
+            if ui.gcs_updating_gender or not ui.access then return end
+            local id = ui.gcs_gender_ids[ui.gcs_gender:CurrentID()]
+            if id then set_gender(ui, id) end
+        end, self)
+        self:AddCallback("gcs_name_refresh", ui_events.BUTTON_CLICKED, function(ui)
+            if ui.access then generate_name(ui, true) end
+        end, self)
+    end
+    function class.LoadIcon(self, randomize)
+        refresh(self, nil, randomize)
+        generate_name(self, false)
+    end
+    local previous_update_icon = class.UpdateIcon
+    function class.UpdateIcon(self, ...)
+        previous_update_icon(self, ...)
+        update_main_portrait(self)
+    end
+    local previous_update = class.Update
+    function class.Update(self, ...)
+        local hint = self.access and self.gcs_gender and self.gcs_gender:IsCursorOverWindow() and self.hint_wnd
+        local timer, text
+        if hint then timer, text = hint.timer, hint.txt end
+        local result = previous_update(self, ...)
+        if hint and self.access and hint == self.hint_wnd then
+            -- The stock update clears an unused hint every frame. Restore only
+            -- its delay state so our hover can mature without skipping updates
+            -- from GAMMA, other wrappers, or the inventory controls.
+            hint.timer, hint.txt = timer, text
+            hint:Update(self.gcs_error and tr("st_gcs_unavailable_hint") or self.gcs_notice or tr("st_gcs_gender_hint"))
+        end
+        -- After the screen is visible, so the box is not drawn beneath it.
+        if self.access and not conflicts_reported then report_conflicts(self) end
+        return result
+    end
+    class.PopupIcon_Controls = init_picker
+    class.PopupIcon_Callbacks = picker_callbacks
+    function class.PopupIcon_Show(self, state) show_picker(self, state, false) end
+    function class.OnIconSelect(self, index)
+        if self.gcs_popup_open and self.table_icon[index] then
+            self.gcs_pending_icon = self.table_icon[index]
+            render_page(self)
+        end
+    end
+    local previous_keyboard = class.OnKeyboard
+    function class.OnKeyboard(self, dik, action)
+        if self.gcs_popup_open then
+            if action == ui_events.WINDOW_KEY_PRESSED and dik == DIK_keys.DIK_ESCAPE then
+                show_picker(self, false, false)
+                return true
+            end
+            return CUIScriptWnd.OnKeyboard(self, dik, action)
+        end
+        return previous_keyboard(self, dik, action)
+    end
+    local previous_random = class.OnRandomize
+    function class.OnRandomize(self, ...)
+        if not self.access then return end
+        local genders = gcs_registry and gcs_registry.list_genders and gcs_registry.list_genders() or {}
+        if #genders == 0 then refresh(self); return end
+        remember(self)
+        local selected = genders[math.random(#genders)]
+        self.selected_gender = type(selected) == "table" and selected.id or selected
+        local result = previous_random(self, ...)
+        generate_name(self, true)
+        return result
+    end
+    local previous_start = class.OnStartGame
+    function class.OnStartGame(self, ...)
+        if not self.access then cancel_creation(); return false end
+        if not validate(self) then
+            cancel_creation()
+            -- Explain the refusal; with no gender available, list the reasons.
+            show_message(self, refusal_text(self))
+            return false
+        end
+        self.gcs_start_pending = capture(self)
+        local result = pack(pcall(previous_start, self, ...))
+        self.gcs_start_pending = nil
+        -- Only a Lua error is detectable: the native start is deferred and
+        -- reports nothing (gcs_identity.discard_unconsumed_creation).
+        if not result[1] then cancel_creation(); error(result[2]) end
+        return unpack(result, 2, result.n)
+    end
+    local menu = ui_main_menu.main_menu
+    local previous_start_game = menu.StartGame
+    function menu.StartGame(self, ...)
+        local ui = self.new_game_dlg
+        local pending = ui and ui.gcs_start_pending
+        if pending then
+            if not gcs_identity or not gcs_identity.stage then
+                ui.gcs_error = tr("st_gcs_registry_missing"); status(ui); return false
+            end
+            local ok, result, reason = pcall(gcs_identity.stage, pending.gender, pending.icon, pending.faction)
+            if not ok or result == false then
+                ui.gcs_error = tr("st_gcs_start_failed") .. ": " .. tostring(ok and reason or result)
+                status(ui)
+                return false
+            end
+        else
+            -- A vanilla/debug Start without a selector capture must never use
+            -- an earlier cancelled character's process-local transport.
+            cancel_creation()
+        end
+        if gcs_identity and gcs_identity.prepare_full_start then
+            local prepared, why = gcs_identity.prepare_full_start()
+            if not prepared then
+                cancel_creation()
+                if ui then ui.gcs_error = tr("st_gcs_start_failed") .. ": " .. tostring(why); status(ui) end
+                return false
+            end
+        end
+        local result = pack(pcall(previous_start_game, self, ...))
+        if not result[1] then cancel_creation(); error(result[2]) end
+        return unpack(result, 2, result.n)
+    end
+    printf("[GAMMA Character Selector] creation UI installed")
+end

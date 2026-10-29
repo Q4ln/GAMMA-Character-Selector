@@ -1,0 +1,57 @@
+-- CGeneralTask caches string IDs and only updates native text when an ID changes.
+-- After a profile change the ID can stay the same while its authored wording
+-- changes. Resolve through the exact-ID translation adapter and refresh those
+-- fields without native table/HUD rebuilding, task functors,
+-- target updates, callbacks, rewards, timestamps, or historical-news rewrites.
+local watched = {}
+local function owned(id, lang)
+    if type(id) ~= "string" or id == "" then return false end
+    return watched[id] or gcs_builtin_dialogue.origins(lang)[id] ~= nil or gcs_dialogue.text(id, lang) ~= nil
+end
+
+function refresh()
+    if not (db and db.actor and task_manager and task_manager.get_task_manager) then return end
+    local manager = task_manager.get_task_manager()
+    if not manager or type(manager.task_info) ~= "table" then return end
+    local lang = system_ini():r_string("string_table", "language")
+    -- Retain IDs previously changed by a custom provider so returning to a
+    -- built-in/unmanaged profile restores those same native fields as well.
+    if gcs_dialogue.texts then
+        for id in pairs(gcs_dialogue.texts(lang)) do watched[id] = true end
+    end
+    for id, record in pairs(manager.task_info) do
+        if type(record) == "table" or type(record) == "userdata" then
+            local native = record.t or db.actor:get_task(id, true)
+            if native then
+                if owned(record.current_title, lang) then native:set_title(game.translate_string(record.current_title)) end
+                if owned(record.current_descr, lang) then native:set_description(game.translate_string(record.current_descr)) end
+            end
+        end
+    end
+end
+
+-- A task given during play: CGeneralTask:give_task stores the raw title and
+-- description IDs on the native task (task_objects.script:138-139), which the
+-- PDA and HUD translate natively, and check_task translates only later ID
+-- changes (193-206). The engine's task_state callback runs
+-- bind_stalker_ext.actor_on_task_callback (bind_stalker_ext.script:321-329),
+-- which sends the "new task" news first: news_manager.send_task translates the
+-- title through game.translate_string, which gcs_dialogue wraps, so the news
+-- already carries the profile's wording. Only then does it call
+-- task_manager.task_callback, which callbacks_gameobject.script wraps to raise
+-- actor_on_task_callback. This handler covers the native PDA and HUD draws.
+-- A field whose native text is already the profile's text stays an ID.
+function task_given(tsk, state, tm, id)
+    if not tsk or state ~= task.in_progress then return end
+    if not (gcs_dialogue and gcs_dialogue.profile and gcs_dialogue.profile()) then return end
+    local manager = tm or (task_manager and task_manager.get_task_manager and task_manager.get_task_manager())
+    local record = manager and type(manager.task_info) == "table" and manager.task_info[id or tsk:get_id()]
+    if type(record) ~= "table" and type(record) ~= "userdata" then return end
+    local title, descr = record.current_title, record.current_descr
+    if type(title) == "string" and gcs_dialogue.display_id(title) ~= title then tsk:set_title(game.translate_string(title)) end
+    if type(descr) == "string" and gcs_dialogue.display_id(descr) ~= descr then tsk:set_description(game.translate_string(descr)) end
+end
+
+function on_game_start()
+    RegisterScriptCallback("actor_on_task_callback", task_given)
+end

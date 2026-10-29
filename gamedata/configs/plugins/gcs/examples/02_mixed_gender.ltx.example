@@ -1,0 +1,46 @@
+; INACTIVE EXAMPLE. Copy to gamedata/configs/plugins/gcs/packs/81_my_mixed.ltx.
+; This standalone definition has no inherited faction portrait pools.
+; Its own shared list explicitly supplies neutral No Data to all factions.
+; Female original portraits require an explicit pool here; profiles do not add them.
+; lass_female_body, lass_female_health and gcs_female_dialogue come from the LASS
+; GAMMA Rebase's pack, so this mix needs the Rebase (requires = gcs, lass). For
+; stock GAMMA, use gamma_male_body, gamma_male_health and gcs_male_dialogue.
+; The game removes every space from a value, so no value may need one.
+
+[my_mixed_package]
+kind = package
+id = my_mixed_pack
+revision = 1
+requires = gcs, lass
+
+[my_mixed_gender_definition]
+kind = gender
+id = my_mixed_gender
+requires = my_mixed_pack
+label = Mixed
+order = 40
+enabled = true
+body = lass_female_body
+voice = gamma_male_voice
+movement = gamma_male_movement
+names = gcs_female_names
+dialogue = gcs_female_dialogue
+health = lass_female_health
+shared = my_mixed_shared
+
+; These are deliberate independent choices, not values inferred from the label.
+; Change each profile ID to the existing option you want before starting a life.
+
+[my_mixed_shared]
+entries = ui_inGame2_no_data
+
+[my_mixed_loner_portraits]
+kind = pool
+gender = my_mixed_gender
+faction = stalker
+requires = my_mixed_pack
+entries = ui_inGame2_strelok_ico, ui_inGame2_neutral_0
+
+; Add another uniquely named pool section for another faction if desired.
+; faction = shared would add this pool to all factions of my_mixed_gender.
+; No new artwork, NPC definitions, or Lua scripts are supplied by this example.

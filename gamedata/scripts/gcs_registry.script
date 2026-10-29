@@ -1,0 +1,830 @@
+-- Data registry. Gender IDs are opaque strings; profiles are independent resources.
+local packages, profiles, genders = {}, {}, {}
+local conflicts, resolved, errors = {}, {}, {}
+local section_errors = {}
+local resolution_generation = 0
+local portraits, npc_specific, npc_models, pool_defs = {}, {}, {}, {}
+local thumbnail_defs, provider_cache = {}, {}
+local loaded, loading = false, false
+local kinds = {"body", "voice", "movement", "names", "dialogue", "health"}
+local factions = {"army", "bandit", "csky", "dolg", "ecolog", "freedom", "killer", "monolith", "stalker", "renegade", "greh", "isg", "zombied"}
+local resource_cache = {}
+local resource_roots = {configs = "$game_config$", meshes = "$game_meshes$", textures = "$game_textures$", sounds = "$game_sounds$", scripts = "$game_scripts$", anims = "$game_anims$"}
+
+local function copy(value)
+    if type(value) ~= "table" then return value end
+    local result = {}
+    for key, item in pairs(value) do result[key] = copy(item) end
+    return result
+end
+
+function split(value, delimiter)
+    local result = {}
+    if type(value) == "table" then return copy(value) end
+    delimiter = delimiter or ","
+    for word in tostring(value or ""):gmatch("[^" .. delimiter .. "]+") do
+        word = word:match("^%s*(.-)%s*$")
+        if word ~= "" then result[#result + 1] = word end
+    end
+    return result
+end
+
+local function valid_id(id)
+    return type(id) == "string" and #id <= 96 and id:match("^[a-z][a-z0-9_%.%-]*$") ~= nil
+end
+
+local function string_list(value)
+    if value == nil or type(value) == "string" then return true end
+    if type(value) ~= "table" then return false end
+    local count, maximum = 0, 0
+    for index, item in pairs(value) do
+        if type(index) ~= "number" or index < 1 or index ~= math.floor(index) or type(item) ~= "string" then return false end
+        count, maximum = count + 1, math.max(maximum, index)
+    end
+    return count == maximum
+end
+
+local function definition_shape(data, kind)
+    for _, field in ipairs({"requires", "resources"}) do
+        if not string_list(data[field]) then return false, "Invalid " .. field .. " list in " .. kind .. ":" .. tostring(data.id) end
+    end
+    if kind == "gender" and data.shared ~= nil and (type(data.shared) ~= "table" or not string_list(data.shared)) then
+        return false, "Invalid shared portrait list in gender:" .. tostring(data.id)
+    end
+    if kind == "package" then
+        -- Files that prove an incompatible install (for example a pack that
+        -- overwrites stock paths) disable this package with a clear reason.
+        for _, field in ipairs({"conflicts", "conflict_signatures"}) do
+            if not string_list(data[field]) then return false, "Invalid " .. field .. " list in package:" .. tostring(data.id) end
+        end
+        if data.conflict_message ~= nil and type(data.conflict_message) ~= "string" then
+            return false, "Invalid conflict_message in package:" .. tostring(data.id)
+        end
+    end
+    if kind ~= "profile" then return true end
+    for _, field in ipairs({"text_provider", "npc_bank", "npc_bank_scope"}) do
+        if data[field] ~= nil and (type(data[field]) ~= "string" or data[field] == "") then
+            return false, "Invalid " .. field .. " in profile:" .. tostring(data.id)
+        end
+    end
+    for _, field in ipairs({"default_subsets", "military_subsets"}) do
+        if not string_list(data[field]) then return false, "Invalid " .. field .. " in profile:" .. tostring(data.id) end
+    end
+    if data.values ~= nil then
+        if type(data.values) ~= "table" then return false, "Invalid values list in profile:" .. tostring(data.id) end
+        local count, maximum = 0, 0
+        for index, row in pairs(data.values) do
+            if type(index) ~= "number" or index < 1 or index ~= math.floor(index) or type(row) ~= "table" then
+                return false, "Invalid values entry in profile:" .. tostring(data.id)
+            end
+            if type(row.section) ~= "string" or row.section == "" or type(row.key) ~= "string" or row.key == "" or type(row.value) ~= "string" then
+                return false, "Invalid INI row in profile:" .. tostring(data.id)
+            end
+            count, maximum = count + 1, math.max(maximum, index)
+        end
+        if count ~= maximum then return false, "Sparse values list in profile:" .. tostring(data.id) end
+    end
+    for _, field in ipairs({"sound_routes", "optional_sound_routes", "textures", "windows", "routes", "text_eng", "text_rus"}) do
+        if data[field] ~= nil then
+            if type(data[field]) ~= "table" then return false, "Invalid " .. field .. " map in profile:" .. tostring(data.id) end
+            for key, value in pairs(data[field]) do
+                if type(key) ~= "string" or key == "" or type(value) ~= "string" or value == "" then
+                    return false, "Invalid " .. field .. " entry in profile:" .. tostring(data.id)
+                end
+            end
+        end
+    end
+    return true
+end
+
+local function invalidate_resolved()
+    resolved = {}
+    resolution_generation = resolution_generation + 1
+end
+
+local function insert(store, kind, data)
+    if type(data) ~= "table" or not valid_id(data.id) then return false, "Invalid " .. kind .. " ID" end
+    local key = kind .. ":" .. data.id
+    if store[data.id] then
+        conflicts[key] = true
+        invalidate_resolved()
+        return false, "Duplicate " .. key
+    end
+    local ok, why = definition_shape(data, kind)
+    if not ok then return false, why end
+    store[data.id] = copy(data)
+    invalidate_resolved()
+    return true
+end
+
+function register_package(data) return insert(packages, "package", data) end
+function register_profile(data) return insert(profiles, "profile", data) end
+function register_gender(data) return insert(genders, "gender", data) end
+
+-- Scalar cache token for consumers of detached definitions. Validation failures
+-- are still checked on every lookup; registrations invalidate derived caches.
+function generation()
+    ensure_loaded()
+    return resolution_generation
+end
+
+function register_portrait(id, data)
+    if type(id) ~= "string" or type(data) ~= "table" then return false end
+    if portraits[id] then return false, "Duplicate portrait " .. id end
+    portraits[id] = copy(data)
+    return true
+end
+
+function register_npc(kind, key, gender)
+    if kind ~= "specific_character" and kind ~= "model" then return false, "Unsupported NPC mapping kind" end
+    if type(key) ~= "string" or not valid_id(gender) then return false, "Invalid NPC mapping" end
+    local target = kind == "model" and npc_models or npc_specific
+    key = kind == "model" and key:lower():gsub("/", "\\"):gsub("%.ogf$", "") or key
+    if target[key] and target[key] ~= gender then target[key] = false
+    elseif target[key] == nil then target[key] = gender end
+    return target[key] ~= false, target[key] == false and "Ambiguous NPC mapping" or nil
+end
+
+function register_pool(data)
+    -- "*" selects every registered gender for this pool; it is not a gender ID.
+    if type(data) ~= "table" or (data.gender ~= "*" and not valid_id(data.gender)) then return false, "Invalid pool" end
+    if not string_list(data.entries) then return false, "Invalid portrait entries in pool" end
+    local ok, why = definition_shape(data, "pool")
+    if not ok then return false, why end
+    pool_defs[#pool_defs + 1] = copy(data)
+    return true
+end
+
+-- An external pack may name its own thumbnail crops; the selector creates the
+-- texture IDs at XML read time instead of shipping copies of the pack's art.
+function register_thumbnail(id, data)
+    if type(id) ~= "string" or #id > 128 or not id:match("^[%w_%.%-]+$") or type(data) ~= "table" then return false, "Invalid thumbnail ID" end
+    if thumbnail_defs[id] then return false, "Duplicate thumbnail " .. id end
+    local texture = data.texture
+    local x, y, width, height = tonumber(data.x), tonumber(data.y), tonumber(data.width), tonumber(data.height)
+    if type(texture) ~= "string" or texture == "" or texture:find('[%c"<>&]') or texture:find("..", 1, true) or texture:find(":", 1, true) then
+        return false, "Invalid thumbnail texture: " .. id
+    end
+    if not x or not y or not width or not height or x < 0 or y < 0 or width <= 0 or height <= 0 then
+        return false, "Invalid thumbnail rectangle: " .. id
+    end
+    thumbnail_defs[id] = {texture = texture, x = x, y = y, width = width, height = height}
+    return true
+end
+
+function resource_exists(kind, path)
+    if type(path) ~= "string" or path == "" or path:find("..", 1, true) or path:find(":", 1, true) then return false end
+    local root = resource_roots[kind]
+    if not root then return false end
+    local key = kind .. "|" .. path
+    if resource_cache[key] == nil then
+        local found = getFS():exist(root, path)
+        resource_cache[key] = found ~= nil and found ~= false
+    end
+    return resource_cache[key]
+end
+
+-- Content signatures identify a stock-path file supplied by an incompatible
+-- install. Loose files are read once; archived stock files never match.
+local function file_contains(kind, path, needle)
+    if type(needle) ~= "string" or needle == "" or not resource_exists(kind, path) then return false end
+    local key = "contains|" .. kind .. "|" .. path .. "|" .. needle
+    if resource_cache[key] == nil then
+        local found = false
+        local fs = getFS()
+        local full = fs and fs.update_path and fs:update_path(resource_roots[kind], path)
+        local file = type(full) == "string" and io and io.open and io.open(full, "rb")
+        if file then
+            local data = file:read("*all") or ""
+            file:close()
+            found = data:find(needle, 1, true) ~= nil
+        end
+        resource_cache[key] = found
+    end
+    return resource_cache[key]
+end
+
+-- Comma separated: ";" starts an LTX comment and would cut the value short.
+local function package_conflict(p)
+    for _, value in ipairs(split(p.conflicts, ",")) do
+        local bits = split(value, "|")
+        if resource_exists(bits[1], bits[2]) then return bits[1] .. "|" .. tostring(bits[2]) end
+    end
+    for _, value in ipairs(split(p.conflict_signatures, ",")) do
+        local bits = split(value, "|")
+        if file_contains(bits[1], bits[2], bits[3]) then return bits[1] .. "|" .. tostring(bits[2]) end
+    end
+end
+
+local function conflict_reason(p, id, conflict)
+    local message = "Incompatible files installed for package"
+    if p.conflict_message and game and game.translate_string then message = game.translate_string(p.conflict_message) end
+    return message .. " [" .. id .. ": " .. conflict .. "]"
+end
+
+local function package_ok(id, visiting)
+    local p = packages[id]
+    if not p or conflicts["package:" .. id] then return false, "Missing or conflicting package: " .. tostring(id) end
+    visiting = visiting or {}
+    if visiting[id] then return false, "Package dependency cycle: " .. id end
+    visiting[id] = true
+    -- An incompatible install is reported before a missing marker: removing
+    -- it is the action the player needs to take first.
+    local conflict = package_conflict(p)
+    if conflict then return false, conflict_reason(p, id, conflict) end
+    if p.probe then
+        local bits = split(p.probe, "|")
+        if not resource_exists(bits[1], bits[2]) then return false, "Required package is not installed: " .. id end
+    end
+    for _, dep in ipairs(split(p.requires)) do
+        local ok, why = package_ok(dep, visiting)
+        if not ok then return false, why end
+    end
+    visiting[id] = nil
+    return true
+end
+
+function has_package(id)
+    ensure_loaded()
+    return package_ok(id)
+end
+
+-- Registered packages whose incompatible-install files are present.
+function package_conflicts()
+    ensure_loaded()
+    local result = {}
+    for id, p in pairs(packages) do
+        if not conflicts["package:" .. id] then
+            local conflict = package_conflict(p)
+            if conflict then result[#result + 1] = {id = id, reason = conflict_reason(p, id, conflict)} end
+        end
+    end
+    table.sort(result, function(a, b) return a.id < b.id end)
+    return result
+end
+
+-- A Lua data script named by a dialogue profile. Plain LTX cannot hold line
+-- breaks or ";", so packs ship authored text as get(language) -> {id = text}.
+local function load_text_provider(name)
+    if type(name) ~= "string" or #name > 96 or not name:match("^[%a_][%w_]*$") then
+        return nil, "Invalid dialogue text_provider: " .. tostring(name)
+    end
+    local cached = provider_cache[name]
+    if cached then return cached.texts, cached.why end
+    local texts, why
+    if not resource_exists("scripts", name .. ".script") then
+        why = "Missing dialogue text_provider script: " .. name
+    else
+        local module = _G[name]
+        if type(module) ~= "table" or type(module.get) ~= "function" then
+            why = "Dialogue text_provider lacks get(language): " .. name
+        else
+            texts = {}
+            for _, lang in ipairs({"eng", "rus"}) do
+                local called, values = pcall(module.get, lang)
+                if not called then
+                    why = "Dialogue text_provider failed: " .. name .. ": " .. tostring(values)
+                elseif values ~= nil and type(values) ~= "table" then
+                    why = "Dialogue text_provider must return a table: " .. name
+                else
+                    local map = {}
+                    for id, text in pairs(values or {}) do
+                        if type(id) ~= "string" or id == "" or type(text) ~= "string" or text == "" then
+                            why = "Invalid dialogue text_provider entry: " .. name .. "/" .. lang
+                            break
+                        end
+                        map[id] = text
+                    end
+                    texts[lang] = map
+                end
+                if why then texts = nil; break end
+            end
+        end
+    end
+    provider_cache[name] = {texts = texts, why = why}
+    return texts, why
+end
+
+-- Detached copy of one language; consumers cache it for hot lookups.
+function text_provider_texts(name, language)
+    local texts, why = load_text_provider(name)
+    if not texts then return nil, why end
+    return copy(texts[language] or {})
+end
+
+local function dependencies(data)
+    for _, id in ipairs(split(data.requires)) do
+        local ok, why = package_ok(id)
+        if not ok then return false, why end
+    end
+    for _, value in ipairs(split(data.resources, ";")) do
+        local bits = split(value, "|")
+        if not resource_exists(bits[1], bits[2]) then return false, "Missing resource: " .. value end
+    end
+    return true
+end
+
+local function merge(parent, child)
+    local result = copy(parent or {})
+    for key, value in pairs(child) do
+        if key ~= "inherits" then result[key] = copy(value) end
+    end
+    -- Dependency inheritance is additive. A child may never discard its parent pack.
+    local seen, deps = {}, {}
+    for _, data in ipairs({parent or {}, child}) do
+        for _, id in ipairs(split(data.requires)) do
+            if not seen[id] then seen[id] = true; deps[#deps + 1] = id end
+        end
+    end
+    result.requires = deps
+    return result
+end
+
+local function validate_data_profile(profile)
+    if profile.type == "names" then
+        local ini = system_ini()
+        for _, field in ipairs({"default_subsets", "military_subsets"}) do
+            local sets = split(profile[field])
+            if #sets == 0 then
+                local literal = profile.literal_name
+                if type(literal) ~= "string" or literal == "" or game.translate_string(literal) == literal then
+                    return false, "Name profile requires installed subsets or a translated literal_name: " .. profile.id
+                end
+            end
+            for _, subset in ipairs(sets) do
+                local section = "stalker_names_" .. tostring(subset)
+                if not ini:section_exist(section) then return false, "Missing name section: " .. section end
+                local nc, lc = ini:r_float_ex(section, "name_cnt"), ini:r_float_ex(section, "last_name_cnt")
+                if not nc or not lc or nc < 1 or lc < 1 or nc ~= math.floor(nc) or lc ~= math.floor(lc) then
+                    return false, "Invalid name counts: " .. section
+                end
+            end
+        end
+    end
+    for _, field in ipairs({"text_eng", "text_rus"}) do
+        if profile[field] ~= nil then
+            if type(profile[field]) ~= "table" then return false, "Invalid " .. field .. " map: " .. profile.id end
+            for from, to in pairs(profile[field]) do
+                if type(from) ~= "string" or from == "" or type(to) ~= "string" or to == "" then
+                    return false, "Invalid " .. field .. " entry: " .. profile.id
+                end
+            end
+        end
+    end
+    local provided
+    if profile.text_provider ~= nil then
+        if profile.type ~= "dialogue" then return false, "text_provider requires a dialogue profile: " .. profile.id end
+        local why
+        provided, why = load_text_provider(profile.text_provider)
+        if not provided then return false, why end
+    end
+    if profile.type == "dialogue" then
+        local builtin = gcs_builtin_dialogue
+        local custom = (type(profile.text_eng) == "table" and type(profile.text_rus) == "table") or provided ~= nil
+        if profile.text_source ~= nil and profile.text_source ~= "" then
+            local known = type(profile.text_source) == "string" and builtin and builtin.has_source and builtin.has_source(profile.text_source)
+            if not known and not custom then return false, "Unknown dialogue text_source: " .. tostring(profile.text_source) end
+        end
+        for key in pairs(profile.routes or {}) do
+            local id = key:match("^native:(.+)$")
+            if id then
+                for _, lang in ipairs({"eng", "rus"}) do
+                    local overrides = profile["text_" .. lang] or {}
+                    local inherited = builtin and builtin.get and builtin.get(profile.text_source, lang) or {}
+                    local supplied = provided and provided[lang] or {}
+                    if not overrides[id] and not inherited[id] and not supplied[id] then
+                        return false, "Native audio alias requires authored " .. lang .. " text: " .. id
+                    end
+                end
+            end
+        end
+    end
+    return true
+end
+
+local function catalogue_profile_error(id)
+    -- Do not autoload dialogue from registry validation. Once its initial
+    -- catalog exists, this API is a non-enumerating error-table lookup only.
+    local dialogue = rawget(_G, "gcs_dialogue")
+    if dialogue and type(dialogue.profile_error) == "function" then
+        return dialogue.profile_error(id)
+    end
+end
+
+local function resolve(store, kind, id, visiting)
+    local key = kind .. ":" .. tostring(id)
+    if kind == "profile" then
+        local why = catalogue_profile_error(id)
+        if why ~= nil then return nil, tostring(why) end
+    end
+    if resolved[key] then
+        if kind == "gender" then
+            for _, profile in pairs(resolved[key].profiles) do
+                local why = catalogue_profile_error(profile.id)
+                if why ~= nil then return nil, tostring(why) end
+            end
+        end
+        return resolved[key]
+    end
+    if conflicts[key] then return nil, "Duplicate " .. key end
+    local item = store[id]
+    if not item then return nil, "Missing " .. key end
+    visiting = visiting or {}
+    if visiting[key] then return nil, "Inheritance cycle: " .. key end
+    visiting[key] = true
+    local parent
+    if item.inherits then
+        local why
+        parent, why = resolve(store, kind, item.inherits, visiting)
+        if not parent then return nil, why end
+    end
+    local result = merge(parent, item)
+    visiting[key] = nil
+    local ok, why = dependencies(result)
+    if not ok then return nil, why end
+    if kind == "profile" then
+        if parent and parent.type ~= result.type then return nil, "Profile inheritance changes type: " .. id end
+        if not result.type or not result.revision then return nil, "Profile lacks type/revision: " .. id end
+        ok, why = validate_data_profile(result)
+        if not ok then return nil, why end
+        if gcs_presentation and gcs_presentation.validate_profile then
+            local called
+            called, ok, why = pcall(gcs_presentation.validate_profile, result)
+            if not called then return nil, "Invalid presentation profile " .. id .. ": " .. tostring(ok) end
+            if not ok then return nil, why end
+        end
+        if result.type == "dialogue" and gcs_npc_audio and gcs_npc_audio.validate_profile then
+            local called
+            called, ok, why = pcall(gcs_npc_audio.validate_profile, result)
+            if not called then return nil, "Invalid dialogue audio profile " .. id .. ": " .. tostring(ok) end
+            if not ok then return nil, why end
+        end
+    else
+        if type(result.label) ~= "string" or result.label == "" then return nil, "Gender lacks label: " .. id end
+        result.profiles = {}
+        for _, typ in ipairs(kinds) do
+            local profile, reason = resolve(profiles, "profile", result[typ])
+            if not profile then return nil, reason end
+            if profile.type ~= typ then return nil, "Wrong type for " .. typ .. ": " .. tostring(result[typ]) end
+            result.profiles[typ] = profile
+        end
+    end
+    resolved[key] = result
+    return result
+end
+
+function get_profile(id)
+    ensure_loaded()
+    local profile, why = resolve(profiles, "profile", id)
+    if not profile then return nil, why end
+    return copy(profile)
+end
+
+-- Inspect only the declared lineage to filter before resolving. In particular,
+-- initial string-table DXML may enumerate dialogue while actor/UI/name-string
+-- services are not ready; unrelated profiles must not be validated then.
+local function declared_profile_type(id, visiting)
+    local item = profiles[id]
+    if not item then return nil end
+    if item.type then return item.type end
+    visiting = visiting or {}
+    if visiting[id] then return nil end
+    visiting[id] = true
+    return item.inherits and declared_profile_type(item.inherits, visiting) or nil
+end
+
+function list_profiles(kind)
+    ensure_loaded()
+    local list, rejected = {}, {}
+    for id in pairs(profiles) do
+        if kind == nil or declared_profile_type(id) == kind then
+            local profile, why = resolve(profiles, "profile", id)
+            if profile then list[#list + 1] = copy(profile) else rejected[id] = why end
+        end
+    end
+    table.sort(list, function(a, b) return a.id < b.id end)
+    return list, rejected
+end
+
+-- Cached definitions stay private; exported definitions are detached snapshots.
+local function resolve_gender(id)
+    ensure_loaded()
+    return resolve(genders, "gender", id)
+end
+
+function get_gender(id)
+    local gender, why = resolve_gender(id)
+    if not gender then return nil, why end
+    return copy(gender)
+end
+
+-- A saved life retains the profile IDs selected at creation/possession. Resolve
+-- the raw gender lineage first, so a later reassignment of its profile fields
+-- cannot replace those saved IDs (or require the newly assigned profile).
+local function gender_definition(id, visiting)
+    if conflicts["gender:" .. tostring(id)] then return nil, "Duplicate gender: " .. tostring(id) end
+    local data = genders[id]
+    if not data then return nil, "Missing gender: " .. tostring(id) end
+    visiting = visiting or {}
+    if visiting[id] then return nil, "Inheritance cycle: gender:" .. tostring(id) end
+    visiting[id] = true
+    local parent
+    if data.inherits then
+        local why
+        parent, why = gender_definition(data.inherits, visiting)
+        if not parent then return nil, why end
+    end
+    visiting[id] = nil
+    return merge(parent, data)
+end
+
+local function resolve_identity_gender(id, profile_refs)
+    ensure_loaded()
+    if profile_refs == nil then return resolve_gender(id) end
+    if type(profile_refs) ~= "table" then return nil, "Invalid saved profile map" end
+    local result, why = gender_definition(id)
+    if not result then return nil, why end
+    if type(result.label) ~= "string" or result.label == "" then return nil, "Saved gender lacks label: " .. tostring(id) end
+    local ok
+    ok, why = dependencies(result)
+    if not ok then return nil, why end
+    result.profiles = {}
+    for _, kind in ipairs(kinds) do
+        local profile_id = profile_refs[kind] or result[kind]
+        if type(profile_id) ~= "string" then return nil, "Invalid saved profile: " .. kind end
+        local profile, reason = resolve(profiles, "profile", profile_id)
+        if not profile then return nil, reason end
+        if profile.type ~= kind then return nil, "Wrong saved profile type: " .. kind end
+        result[kind], result.profiles[kind] = profile_id, profile
+    end
+    return result
+end
+
+function get_identity_gender(id, profile_refs)
+    local gender, why = resolve_identity_gender(id, profile_refs)
+    if not gender then return nil, why end
+    return copy(gender)
+end
+
+-- Hot consumers such as NPC audio need one profile, while all saved references
+-- must still pass validation. Never expose the cached profile itself.
+function get_identity_profile(id, profile_refs, kind)
+    local gender, why = resolve_identity_gender(id, profile_refs)
+    if not gender then return nil, why end
+    local profile = gender.profiles[kind]
+    if not profile then return nil, "Unknown profile kind: " .. tostring(kind) end
+    return copy(profile)
+end
+
+function validate_gender(id)
+    local gender, why = resolve_gender(id)
+    if not gender then return false, why end
+    if gender.enabled == false or gender.enabled == "false" then return false, "Gender is disabled: " .. id end
+    for _, faction in ipairs(factions) do
+        if #pool(id, faction) == 0 then return false, "No valid portraits: " .. id .. "/" .. faction end
+    end
+    return true
+end
+
+-- Registered, non-conflicting gender IDs in dropdown order, without
+-- validation. The creation screen names one when none is available.
+function registered_genders()
+    ensure_loaded()
+    local rows = {}
+    for id, data in pairs(genders) do
+        if not conflicts["gender:" .. id] then rows[#rows + 1] = {id = id, order = tonumber(data.order) or 100} end
+    end
+    table.sort(rows, function(a, b) return a.order == b.order and a.id < b.id or a.order < b.order end)
+    local ids = {}
+    for i, row in ipairs(rows) do ids[i] = row.id end
+    return ids
+end
+
+function list_genders()
+    ensure_loaded()
+    local list = {}
+    -- Rebuild the gender reasons on every enumeration: a gender that now
+    -- validates (or is gone) must not keep a stale reason in diagnostics or
+    -- the New Game refusal text. The pack-discovery reason is kept.
+    local current = {manifest = errors.manifest}
+    for section, why in pairs(section_errors) do current["section:" .. section] = why end
+    for id in pairs(genders) do
+        local ok, why = validate_gender(id)
+        if ok then list[#list + 1] = copy(resolve_gender(id)) else current[id] = why end
+    end
+    errors = current
+    table.sort(list, function(a, b)
+        local aa, bb = tonumber(a.order) or 100, tonumber(b.order) or 100
+        return aa == bb and a.id < b.id or aa < bb
+    end)
+    return list
+end
+
+function gender_label(id)
+    local g = resolve_gender(id)
+    return g and game.translate_string(g.label) or (game.translate_string("gcs_missing_gender") .. ": " .. tostring(id))
+end
+
+function portrait_exists(id)
+    ensure_loaded()
+    local p = portraits[id]
+    if not p or not p.texture then return false end
+    return resource_exists("textures", p.texture .. ".dds") or resource_exists("textures", p.texture .. ".seq") or resource_exists("textures", p.texture .. ".ogm")
+end
+
+function thumbnail(id)
+    ensure_loaded()
+    return portraits[id] and portraits[id].thumbnail or "ui_inGame2_no_data"
+end
+
+-- Pack-declared thumbnail crops whose source texture is installed.
+function thumbnails()
+    ensure_loaded()
+    local list = {}
+    for id, data in pairs(thumbnail_defs) do
+        if resource_exists("textures", data.texture .. ".dds") then
+            local item = copy(data)
+            item.id = id
+            list[#list + 1] = item
+        end
+    end
+    table.sort(list, function(a, b) return a.id < b.id end)
+    return list
+end
+
+function pool(gender, faction)
+    ensure_loaded()
+    local g = resolve_gender(type(gender) == "table" and gender.id or gender)
+    if not g then return {} end
+    local entries, seen, result = {}, {}, {}
+    -- Pool inheritance is explicit, following the gender inheritance chain.
+    local lineage, id = {}, g.id
+    while id and not lineage[id] do lineage[id] = true; id = genders[id] and genders[id].inherits end
+    for _, value in ipairs(g.shared or {}) do entries[#entries + 1] = value end
+    for _, data in ipairs(pool_defs) do
+        if (data.gender == "*" or lineage[data.gender]) and (data.faction == faction or data.faction == "shared") and dependencies(data) then
+            for _, value in ipairs(split(data.entries)) do entries[#entries + 1] = value end
+        end
+    end
+    for _, icon in ipairs(entries) do
+        local p = portraits[icon]
+        local canonical = p and p.canonical or icon
+        if portrait_exists(icon) and not seen[canonical] then
+            seen[canonical] = true
+            result[#result + 1] = portrait_exists(canonical) and canonical or icon
+        end
+    end
+    return result
+end
+
+function name(gender, faction)
+    local g = resolve_gender(type(gender) == "table" and gender.id or gender)
+    if not g then return "" end
+    local p = g.profiles.names
+    local sets = split((faction == "army" or faction == "dolg" or faction == "isg") and p.military_subsets or p.default_subsets)
+    if #sets == 0 then return p.literal_name and game.translate_string(p.literal_name) or "" end
+    local subset = sets[math.random(#sets)]
+    local sec = "stalker_names_" .. subset
+    local ini = system_ini()
+    if not ini:section_exist(sec) then return "" end
+    local nc, lc = ini:r_float_ex(sec, "name_cnt"), ini:r_float_ex(sec, "last_name_cnt")
+    if not nc or not lc or nc < 1 or lc < 1 then return "" end
+    return game.translate_string("name_" .. subset .. "_" .. math.random(0, nc - 1)) .. " " .. game.translate_string("lname_" .. subset .. "_" .. math.random(0, lc - 1))
+end
+
+function npc_data(se_obj)
+    if not se_obj then return nil end
+    local ok, data = pcall(utils_stpk.get_stalker_data, se_obj)
+    return ok and data or nil
+end
+
+function resolve_npc(se_obj)
+    ensure_loaded()
+    local data = npc_data(se_obj)
+    if not data then return nil, "No NPC packet" end
+    local id = npc_specific[data.specific_character]
+    if id == false then return nil, "Conflicting specific-character mapping" end
+    if id == nil then
+        local model = tostring(data.visual_name or ""):lower():gsub("/", "\\"):gsub("%.ogf$", "")
+        id = npc_models[model]
+    end
+    if not id then return nil, "Unmapped NPC: " .. tostring(data.specific_character), data.specific_character end
+    local g, why = get_gender(id)
+    return g, why, data.specific_character
+end
+
+function requirements(gender)
+    local g = type(gender) == "table" and gender or resolve_gender(gender)
+    if not g then return {}, {} end
+    local seen, ids, refs = {}, {}, {}
+    local function collect(data)
+        for _, id in ipairs(split(data.requires)) do
+            if not seen[id] then
+                seen[id] = true; ids[#ids + 1] = id
+                if packages[id] then collect(packages[id]) end
+            end
+        end
+    end
+    collect(g)
+    for _, typ in ipairs(kinds) do
+        local p = g.profiles[typ]
+        refs[typ] = p.id
+        collect(p)
+    end
+    table.sort(ids)
+    return ids, refs
+end
+
+local function fields(ini, section)
+    local data = {}
+    if not ini:section_exist(section) then return data end
+    for i = 0, ini:line_count(section) - 1 do
+        local _, key, value = ini:r_line(section, i, "", "")
+        data[key] = value
+    end
+    return data
+end
+
+local function read_profile(ini, data)
+    if data.builtin then
+        local builtin = gcs_builtin_presentation.get(data.builtin)
+        if builtin then data = merge(builtin, data) end
+    end
+    for _, key in ipairs({"sound_routes", "optional_sound_routes", "textures", "windows", "routes", "text_eng", "text_rus"}) do
+        if type(data[key]) == "string" then data[key] = fields(ini, data[key]) end
+    end
+    if data.writes then
+        data.values = {}
+        for address, value in pairs(fields(ini, data.writes)) do
+            local bits = split(address, "|")
+            data.values[#data.values + 1] = {section = bits[1], key = bits[2], value = value}
+        end
+        table.sort(data.values, function(a, b) return a.section .. a.key < b.section .. b.key end)
+    end
+    return data
+end
+
+local function load_section(ini, section)
+    local data = fields(ini, section)
+    if data.kind == "package" then register_package(data)
+    elseif data.kind == "profile" then register_profile(read_profile(ini, data))
+    elseif data.kind == "gender" then
+        data.shared = data.shared and split(fields(ini, data.shared).entries) or nil
+        register_gender(data)
+    elseif data.kind == "pool" then register_pool(data)
+    elseif data.kind == "npc_map" then
+        for key, gender in pairs(fields(ini, data.entries)) do register_npc(data.mapping_type or "specific_character", key, gender) end
+    elseif data.kind == "portraits" then
+        for id, value in pairs(fields(ini, data.entries)) do
+            local bits = split(value, "|")
+            register_portrait(id, {texture = bits[1], thumbnail = bits[2] or id, canonical = bits[3] or id})
+        end
+    elseif data.kind == "thumbnails" then
+        for id, value in pairs(fields(ini, data.entries)) do
+            local bits = split(value, "|")
+            local ok, why = register_thumbnail(id, {texture = bits[1], x = bits[2], y = bits[3], width = bits[4], height = bits[5]})
+            if not ok and printf then printf("[GAMMA Character Selector] %s", tostring(why)) end
+        end
+    end
+end
+
+-- A Lua error while reading one pack section (for example a profile naming a
+-- builtin that is not installed) skips only that section: whatever depended
+-- on it fails validation with its own reason, and the error is reported.
+-- An error outside the sections (no manifest, no builtin module) ends the
+-- load as well, with its reason kept for the New Game refusal; it is not
+-- retried, since a second pass would register the builtins twice.
+function ensure_loaded()
+    if loaded or loading then return end
+    loading = true
+    local ok, problem = pcall(function()
+        if gcs_builtin_presentation and gcs_builtin_presentation.list then
+            for _, p in ipairs(gcs_builtin_presentation.list()) do register_profile(p) end
+        end
+        local ini = ini_file("plugins\\gcs\\manifest.ltx")
+        local sections = {}
+        ini:section_for_each(function(section) sections[#sections + 1] = section end)
+        if #sections == 0 then
+            errors.manifest = "No character packs loaded from plugins\\gcs\\manifest.ltx; check packs\\importer.inc and pack files"
+            if printf then printf("[GAMMA Character Selector] %s", errors.manifest) end
+        end
+        table.sort(sections)
+        for _, section in ipairs(sections) do
+            local read, why = pcall(load_section, ini, section)
+            if not read then
+                section_errors[section] = "Pack section [" .. section .. "] could not be read: " .. tostring(why)
+                if printf then printf("[GAMMA Character Selector] %s", section_errors[section]) end
+            end
+        end
+    end)
+    if not ok then
+        errors.manifest = "Character packs could not be read: " .. tostring(problem)
+        if printf then printf("[GAMMA Character Selector] %s", errors.manifest) end
+    end
+    loading, loaded = false, true
+end
+
+function diagnostics()
+    list_genders()
+    return copy(errors), copy(conflicts)
+end

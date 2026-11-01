@@ -1,6 +1,6 @@
 # GAMMA Character Selector
 
-Version `d2026.10.29.2`
+Version `d2026.11.1.2`
 
 A character creator for G.A.M.M.A. On the New Game screen you choose a gender,
 a portrait from that gender's faction pool and a generated name, and the
@@ -153,7 +153,8 @@ Saves made with rc15:
 - **Mods that overwrite GAMMA's player files.** The known ones are detected and
   refused; remove them (see Installation).
 - **Gender packs** register through the Selector's pack interface and require
-  the Selector.
+  the Selector. A pack setting for a weapon, outfit or sound that your GAMMA
+  lacks is skipped, not a reason to hide the gender (see Options).
 - **New Game Templates.** Superseded by the built-in presets; do not enable it
   alongside the Selector. Its stored presets stay readable and untouched.
 - **Azazel mode.** The Selector replaces Anomaly's
@@ -235,6 +236,18 @@ define in your own `text\eng` and `text\rus` XML files (Windows-1251). Keep
 `id` values unchanged once a save uses them; `enabled = false` hides a gender
 from new characters while its saves still load.
 
+If the running game lacks something a pack's body, voice, movement or name
+profile names (a weapon or outfit section, a model, a HUD section, a sound or a
+name list), that one setting is skipped and the `xray_*.log` names it on a line
+such as `[GCS] <profile>: <section>/<key> is dropped: <reason>`. Of those, only
+a body profile's rows for the player's own body, legs and hands (`[actor]`,
+`[actor_hud]` and `[actor_hud_05]`), its no-outfit model and a health profile's
+atlas are required. A dialogue profile's own files (the recordings its `routes`
+name, its `npc_bank` file and its `text_provider` script) are required too, and
+so is anything a pack lists in `resources`: ship them in your pack. If one of
+these is missing, that gender is left out of the New Game screen and the log
+says why on a `Gender unavailable` line.
+
 ## Adding or removing mid-save
 
 - **Adding the Selector to an existing game:** older saves load unchanged as
@@ -264,16 +277,20 @@ it is not supported.
 
 ## Known issues
 
-- Apart from its build number, this build changes only its README and
-  meta.ini; nothing in this build has been tested in game yet. In the previous
-  build, your own inventory portrait was checked in one save at 1920x1080. The
-  build before it, which in game lacks only the inventory portrait fix, was
-  played for a short while in a new game with a gender from a gender pack.
-  Male, which the Selector offers on its own, has not been played in game
-  since it moved to GAMMA's own files. Everything else, including the other
-  side's inventory portrait and other screen shapes, is covered by component
-  tests only. Report problems with the newest `xray_*.log` from Anomaly's
-  `appdata\logs` folder.
+- Nothing in this build has been tested in game yet. The build before it,
+  which differs only in still showing a hint popup on the gender control, was
+  checked in game at the main menu, where the New Game list and the new pack
+  checks worked. That build changed how gender packs are checked; component
+  tests cover that against GAMMA's real files,
+  also with 3DSS's scope sections, Voiced Actor's hunger and thirst lines and
+  Oleh's hit sounds taken away. Of the code it shares with earlier builds, your
+  own inventory portrait was checked in one save at 1920x1080, and a build
+  without the inventory portrait fix was played for a short while in a new
+  game with a gender from a gender pack. Male, which the Selector offers on its
+  own, has not been played in game since it moved to GAMMA's own files.
+  Everything else, including the other side's inventory portrait and other
+  screen shapes, is covered by component tests only. Report problems with the
+  newest `xray_*.log` from Anomaly's `appdata\logs` folder.
 - The console commands `load`, `load_last_save` and `start server(...)` bypass
   the Load menu's checks, so a save the Selector would refuse is loaded anyway
   (a body model that is no longer installed is replaced by GAMMA's no-outfit
@@ -286,6 +303,23 @@ it is not supported.
   character's gender are text only: the NPC stays silent for them.
 
 ## Changelog
+
+### d2026.11.1.2
+
+- The gender control on the New Game screen no longer shows a hint popup when
+  the mouse is over it. A remembered portrait that is no longer available is
+  noted in the `xray_*.log` instead.
+
+### d2026.11.1.1
+
+- A gender from a gender pack no longer disappears from the New Game screen
+  when your GAMMA lacks one thing it uses. A setting for a weapon, outfit or
+  sound that is not installed (3DSS switched off, for example, or an older
+  GAMMA) is now skipped and logged, as Male's already were; an NPC voice set
+  with a missing recording is left out, so those lines play as they would
+  without the pack; a missing name list only means no generated name. Only the
+  pack's body, first-person legs and hands, no-outfit model and health-HUD
+  atlas, and its own dialogue files, are still required.
 
 ### d2026.10.29.2
 

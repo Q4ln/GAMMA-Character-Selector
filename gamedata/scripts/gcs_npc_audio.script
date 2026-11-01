@@ -66,14 +66,20 @@ local function bank_list(value)
     return result
 end
 
+-- A malformed set returns nil and the reason. A well-formed set always comes
+-- back; when a recording it names is not installed, the reason and true follow
+-- it, and build_bank checks it against the bank but routes nothing from it.
+-- Structure is checked before files, so whether a bank is accepted never
+-- depends on which recordings a player has installed.
 local function bank_set(file, section, f)
     local stock = bank_path(f.stock_set)
     if not stock then return nil, "Invalid stock_set in NPC voice bank: " .. section end
     local set = {key = "gcs-pack:" .. file .. ":" .. stock, stock = stock, paths = {}, extra = {}}
     if f.single == "true" then
         local target = bank_path(f.path)
-        if not target or not sound_exists(target) then return nil, "Missing single NPC voice file: " .. section end
+        if not target then return nil, "Invalid single NPC voice file: " .. section end
         set.single = target
+        if not sound_exists(target) then return set, "Missing single NPC voice file: " .. section, true end
         return set
     end
     local prefix = bank_path(f.pack_set or f.lass_set)
@@ -88,14 +94,18 @@ local function bank_set(file, section, f)
         or not installed_paths or #installed_paths ~= #installed or not stocked or not explicit or not unreachable then
         return nil, "Invalid numbered NPC voice set: " .. section
     end
-    local function add(index, target)
-        if set.paths[index] then return false end
-        set.paths[index] = target
-        return sound_exists(target)
+    -- A repeated index is malformed; the first member whose file is not
+    -- installed is only remembered, and reported once the structure holds.
+    local missing
+    local function member(n, target)
+        local why = "Missing or repeated NPC voice member: " .. section .. "/" .. n
+        if set.paths[n] then return why end
+        set.paths[n] = target
+        if not missing and not sound_exists(target) then missing = why end
     end
-    for _, n in ipairs(packed) do if not add(n, prefix .. n) then return nil, "Missing or repeated NPC voice member: " .. section .. "/" .. n end end
-    for i, n in ipairs(installed) do if not add(n, installed_paths[i]) then return nil, "Missing or repeated NPC voice member: " .. section .. "/" .. n end end
-    for _, n in ipairs(stocked) do if not add(n, stock .. n) then return nil, "Missing or repeated NPC voice member: " .. section .. "/" .. n end end
+    for _, n in ipairs(packed) do local why = member(n, prefix .. n); if why then return nil, why end end
+    for i, n in ipairs(installed) do local why = member(n, installed_paths[i]); if why then return nil, why end end
+    for _, n in ipairs(stocked) do local why = member(n, stock .. n); if why then return nil, why end end
     -- The run 1..count is what sound_theme reaches; explicit indices are
     -- played by full name. Together they must be exactly the listed members.
     local wanted = {}
@@ -104,12 +114,14 @@ local function bank_set(file, section, f)
     for n in pairs(set.paths) do if not wanted[n] then return nil, "NPC voice member outside the set: " .. section .. "/" .. n end end
     for n in pairs(wanted) do if not set.paths[n] then return nil, "NPC voice set has a gap: " .. section .. "/" .. n end end
     for _, n in ipairs(unreachable) do
-        if set.paths[n] or not sound_exists(prefix .. n) then return nil, "Invalid unreachable NPC voice member: " .. section .. "/" .. n end
+        if set.paths[n] then return nil, "Invalid unreachable NPC voice member: " .. section .. "/" .. n end
+        if not missing and not sound_exists(prefix .. n) then missing = "Invalid unreachable NPC voice member: " .. section .. "/" .. n end
         set.extra[n] = prefix .. n
     end
     set.theme_paths = {}
     for n = 1, count do set.theme_paths[n] = set.paths[n] end
     set.theme_list = table.concat(set.theme_paths, ",")
+    if missing then return set, missing, true end
     return set
 end
 
@@ -126,19 +138,36 @@ local function build_bank(path)
     if #sections == 0 then return nil, "NPC voice bank has no npc_set_ sections: " .. file end
     local declared = bank_fields(ini, "npc_sets").count
     if declared and declared ~= "" and tonumber(declared) ~= #sections then return nil, "NPC voice bank set count mismatch: " .. file end
-    local bank = {file = file, sets = {}, members = {}, lines = {}}
+    local bank = {file = file, sets = {}, members = {}, lines = {}, skipped = {}}
+    -- Duplicate sets and conflicting members are checked across every set,
+    -- also one whose recordings are not installed.
+    local stocks, claimed = {}, {}
     for _, section in ipairs(sections) do
-        local set, why = bank_set(file, section, bank_fields(ini, section))
+        local set, why, missing = bank_set(file, section, bank_fields(ini, section))
         if not set then return nil, why end
-        if bank.sets[set.stock] then return nil, "Duplicate stock_set in NPC voice bank: " .. section end
-        bank.sets[set.stock] = set
+        if stocks[set.stock] then return nil, "Duplicate stock_set in NPC voice bank: " .. section end
+        stocks[set.stock] = true
         local pairs_to_map = {}
         if set.single then pairs_to_map[set.stock] = set.single
         else for n, target in pairs(set.paths) do pairs_to_map[set.stock .. n] = target end end
         for original, target in pairs(pairs_to_map) do
-            if bank.members[original] and bank.members[original] ~= target then return nil, "Conflicting NPC voice member: " .. original end
-            bank.members[original] = target
-            if target ~= original then bank.lines[target] = original end
+            if claimed[original] and claimed[original] ~= target then return nil, "Conflicting NPC voice member: " .. original end
+            claimed[original] = target
+        end
+        if missing then
+            -- A set whose recordings are not installed (a voice mod that is
+            -- off or older) routes nothing: its lines play as they would
+            -- without the bank (GAMMA's own for lines not addressed to the
+            -- player; the profile's audio_source or the silent text-only
+            -- collection for an addressed audited line).
+            bank.skipped[#bank.skipped + 1] = section
+            if printf then printf("[GAMMA Character Selector] NPC voice set skipped: %s (%s)", tostring(why), file) end
+        else
+            bank.sets[set.stock] = set
+            for original, target in pairs(pairs_to_map) do
+                bank.members[original] = target
+                if target ~= original then bank.lines[target] = original end
+            end
         end
     end
     return bank

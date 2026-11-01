@@ -3,7 +3,7 @@
 
 -- Release build: meta.ini version, the README header, the archive name and
 -- the install line in install() carry the same string.
-BUILD = "d2026.10.29.2"
+BUILD = "d2026.11.1.2"
 
 local identity, last_filename
 local installed, callbacks_installed = false, false

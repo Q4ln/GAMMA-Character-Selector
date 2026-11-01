@@ -17,8 +17,6 @@
   <string id="gcs_missing_gender"><text>Unavailable gender</text></string>
   <string id="gcs_azazel_checkpoint_failed"><text>Character transfer finished, but its checkpoint save could not be made or loaded. Load an earlier save.</text></string>
   <string id="gcs_azazel_transfer_incomplete"><text>Character transfer did not complete. Load an earlier save.</text></string>
-  <string id="st_gcs_gender_hint"><text>Gender controls your character and available portraits. It stays fixed for this life.</text></string>
-  <string id="st_gcs_unavailable_hint"><text>This character is unavailable. Choose another gender, or check the installed character packs.</text></string>
   <string id="st_gcs_refresh_name"><text>Generate another name</text></string>
   <string id="st_gcs_no_gender"><text>No gender is available for a new character. Enable a character pack (Female needs the LASS GAMMA Rebase) and restart the game.</text></string>
   <string id="st_gcs_package_conflict"><text>Incompatible character files are installed. Characters that depend on them stay unavailable until they are removed:</text></string>

@@ -183,10 +183,9 @@ local function resource(kind, path, extension)
     return gcs_registry.resource_exists(kind, path)
 end
 
--- A pack may mark routes optional (optional_sound_routes), for files shipped
--- by an optional component. One whose target is not installed is skipped and
--- the stock sound plays; a required route to a missing file still rejects the
--- whole profile.
+-- A route whose target is not installed is skipped and the stock sound plays:
+-- an optional route (optional_sound_routes, for files shipped by an optional
+-- component) silently, a required one with a log line (validate_profile).
 local function routes_of(profile)
     local result = {}
     if type(profile) ~= "table" then return result end
@@ -196,7 +195,9 @@ local function routes_of(profile)
         end
     end
     if type(profile.sound_routes) == "table" then
-        for from, to in pairs(profile.sound_routes) do result[from] = to end
+        for from, to in pairs(profile.sound_routes) do
+            if type(from) == "string" and resource("sounds", to, ".ogg") then result[from] = to end
+        end
     end
     return result
 end
@@ -214,14 +215,59 @@ local function is_builtin(profile)
     return type(profile) == "table" and profile.id ~= nil and gcs_builtin_presentation.get(profile.id) ~= nil
 end
 
--- Each dropped built-in row is logged once per Lua state.
+-- Each dropped row or route is logged once per Lua state. A pack row names
+-- why it was dropped; a built-in row is dropped only for a missing key.
 local dropped_rows = {}
-local function drop_row(profile, row)
+local function drop_row(profile, row, reason)
     local key = tostring(profile.id) .. "/" .. id(row)
     if dropped_rows[key] then return end
     dropped_rows[key] = true
-    if printf then
+    if not printf then return end
+    if reason then
+        printf("[GCS] %s: %s/%s is dropped: %s", tostring(profile.id), row.section, row.key, reason)
+    else
         printf("[GCS] %s: %s/%s is not in the running game; that row is dropped", tostring(profile.id), row.section, row.key)
+    end
+end
+
+local function drop_route(profile, from, to)
+    local key = tostring(profile.id) .. "/route\t" .. from
+    if dropped_rows[key] then return end
+    dropped_rows[key] = true
+    if printf then
+        printf("[GCS] %s: sound route %s is dropped: missing sound %s", tostring(profile.id), from, tostring(to))
+    end
+end
+
+-- The player's own body, first-person legs and default hands (sections that
+-- vanilla Anomaly defines). A pack whose rows for these cannot be used is not
+-- a usable gender; any other row the running game cannot use is dropped, so a
+-- missing weapon, outfit or sound mod costs the gender only that row.
+local essential_sections = {actor = true, actor_hud = true, actor_hud_05 = true}
+local function essential(profile, row)
+    return profile.type == "body" and essential_sections[row.section] == true
+end
+
+-- Why the running game cannot use a row, or nil. A built-in row's value is
+-- never written, so only its section and key are checked.
+local function row_problem(profile, row, ini, builtin)
+    if not ini:section_exist(row.section) or (not ini:line_exist(row.section, row.key) and not addable(row)) then
+        return "Missing presentation INI key: " .. row.section .. "/" .. row.key
+    end
+    if builtin then return nil end
+    if model_keys[row.key] and not resource("meshes", row.value, ".ogf") then
+        return "Missing presentation model: " .. row.value
+    end
+    if (row.key == "player_hud_section" or row.key == "hud") and not ini:section_exist(row.value) then
+        return "Missing HUD section: " .. row.value
+    end
+    if profile.type == "voice" or row.key:match("^snd_") or row.key:match("^scripted_snd_") then
+        for path in row.value:gmatch("[^,]+") do
+            path = path:match("^%s*(.-)%s*$")
+            if path ~= "" and path ~= "none" and not tonumber(path) and not resource("sounds", path, ".ogg") then
+                return "Missing presentation sound: " .. path
+            end
+        end
     end
 end
 
@@ -244,28 +290,20 @@ function validate_profile(profile)
     -- A built-in profile (Male) is GAMMA's stock. prepare never writes its
     -- rows' values, only the running game's stock record, so they are checked
     -- only for what is used: a section or key the running game lacks drops
-    -- that row (prepare skips it), and no value check applies.
+    -- that row (prepare skips it), and no value check applies. A pack row the
+    -- running game cannot use is dropped the same way, with its reason, unless
+    -- it is essential; prepare skips exactly the rows dropped here.
     local builtin = is_builtin(profile)
     local seen, ini = {}, system_ini()
     for _, row in ipairs(profile.values or {}) do
         if not permitted(profile, row) then return false, "Presentation key is not allowed: " .. tostring(row.section) .. "/" .. tostring(row.key) end
         if seen[id(row)] then return false, "Duplicate presentation key: " .. id(row) end
         seen[id(row)] = true
-        if not ini:section_exist(row.section) or (not ini:line_exist(row.section, row.key) and not addable(row)) then
-            if not builtin then return false, "Missing presentation INI key: " .. row.section .. "/" .. row.key end
-            drop_row(profile, row)
-        elseif builtin then -- its value is never written: nothing to check
-        elseif model_keys[row.key] and not resource("meshes", row.value, ".ogf") then
-            return false, "Missing presentation model: " .. row.value
-        elseif (row.key == "player_hud_section" or row.key == "hud") and not ini:section_exist(row.value) then
-            return false, "Missing HUD section: " .. row.value
-        elseif profile.type == "voice" or row.key:match("^snd_") or row.key:match("^scripted_snd_") then
-            for path in row.value:gmatch("[^,]+") do
-                path = path:match("^%s*(.-)%s*$")
-                if path ~= "" and path ~= "none" and not tonumber(path) and not resource("sounds", path, ".ogg") then
-                    return false, "Missing presentation sound: " .. path
-                end
-            end
+        local problem = row_problem(profile, row, ini, builtin)
+        if problem then
+            if builtin then drop_row(profile, row)
+            elseif essential(profile, row) then return false, problem
+            else drop_row(profile, row, problem) end
         end
     end
     -- Male's no-outfit body is the engine's (server_visual), not this value.
@@ -275,8 +313,14 @@ function validate_profile(profile)
     if profile.type == "voice" and profile.selector ~= "gamma" and profile.selector ~= "lass" then
         return false, "Voice selector must be gamma or lass"
     end
+    -- A required route keeps the map shape; one whose target is not installed
+    -- is dropped (routes_of skips it) and the stock sound plays.
     for from, to in pairs(profile.sound_routes or {}) do
-        if type(from) ~= "string" or not resource("sounds", to, ".ogg") then return false, "Invalid sound route: " .. tostring(from) end
+        if type(from) ~= "string" or from == "" or type(to) ~= "string" or to == ""
+            or to:find("..", 1, true) or to:find(":", 1, true) or to:find("[%c,]") then
+            return false, "Invalid sound route: " .. tostring(from)
+        end
+        if not resource("sounds", to, ".ogg") then drop_route(profile, from, to) end
     end
     -- An optional target may be absent; its shape is still checked.
     for from, to in pairs(profile.optional_sound_routes or {}) do
@@ -383,14 +427,23 @@ local function prepare(gender)
         -- running game's stock record instead, so a GAMMA update or another
         -- mod that changes one of these keys leaves Male equal to stock.
         -- A built-in row whose section or key the running game lacks is
-        -- dropped (validate_profile): there is no stock value to write.
+        -- dropped (validate_profile): there is no stock value to write. A
+        -- pack row is dropped for the same reasons validate_profile drops it,
+        -- so no value naming a missing model, HUD section or sound is written.
         local stock = is_builtin(profile)
+        local ini = system_ini()
         for _, row in ipairs(profile.values or {}) do
             if not permitted(profile, row) then return nil, "Presentation key is not allowed: " .. id(row) end
-            local ok, why = capture(row)
-            if ok then rows[id(row)] = stock and captured[id(row)] or row
-            elseif stock then drop_row(profile, row)
-            else return nil, why end
+            local problem = not stock and row_problem(profile, row, ini, false)
+            if problem then
+                if essential(profile, row) then return nil, problem end
+                drop_row(profile, row, problem)
+            else
+                local ok, why = capture(row)
+                if ok then rows[id(row)] = stock and captured[id(row)] or row
+                elseif stock then drop_row(profile, row)
+                else return nil, why end
+            end
         end
     end
     local routed, route_error = route_use_sounds(gender, system_ini(), rows)

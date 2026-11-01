@@ -340,6 +340,19 @@ local function merge(parent, child)
     return result
 end
 
+-- Why a name subset cannot be used in the running game, or nil.
+local function name_subset_problem(ini, subset)
+    local section = "stalker_names_" .. tostring(subset)
+    if not ini:section_exist(section) then return "Missing name section: " .. section end
+    local nc, lc = ini:r_float_ex(section, "name_cnt"), ini:r_float_ex(section, "last_name_cnt")
+    if not nc or not lc or nc < 1 or lc < 1 or nc ~= math.floor(nc) or lc ~= math.floor(lc) then
+        return "Invalid name counts: " .. section
+    end
+end
+
+-- Each skipped name subset is logged once per Lua state.
+local skipped_subsets = {}
+
 local function validate_data_profile(profile)
     if profile.type == "names" then
         local ini = system_ini()
@@ -351,12 +364,15 @@ local function validate_data_profile(profile)
                     return false, "Name profile requires installed subsets or a translated literal_name: " .. profile.id
                 end
             end
+            -- A subset the running game lacks (a names mod that is off or
+            -- older) is skipped. With none left, name() returns "" and the
+            -- creation screen keeps the name already in its box.
             for _, subset in ipairs(sets) do
-                local section = "stalker_names_" .. tostring(subset)
-                if not ini:section_exist(section) then return false, "Missing name section: " .. section end
-                local nc, lc = ini:r_float_ex(section, "name_cnt"), ini:r_float_ex(section, "last_name_cnt")
-                if not nc or not lc or nc < 1 or lc < 1 or nc ~= math.floor(nc) or lc ~= math.floor(lc) then
-                    return false, "Invalid name counts: " .. section
+                local problem = name_subset_problem(ini, subset)
+                local key = tostring(profile.id) .. "/" .. tostring(subset)
+                if problem and not skipped_subsets[key] then
+                    skipped_subsets[key] = true
+                    if printf then printf("[GCS] %s: name subset %s is skipped: %s", tostring(profile.id), tostring(subset), problem) end
                 end
             end
         end
@@ -681,14 +697,18 @@ function name(gender, faction)
     local g = resolve_gender(type(gender) == "table" and gender.id or gender)
     if not g then return "" end
     local p = g.profiles.names
-    local sets = split((faction == "army" or faction == "dolg" or faction == "isg") and p.military_subsets or p.default_subsets)
-    if #sets == 0 then return p.literal_name and game.translate_string(p.literal_name) or "" end
+    local listed = split((faction == "army" or faction == "dolg" or faction == "isg") and p.military_subsets or p.default_subsets)
+    if #listed == 0 then return p.literal_name and game.translate_string(p.literal_name) or "" end
+    -- Only subsets the running game has (validate_data_profile skipped the rest).
+    local ini = system_ini()
+    local sets = {}
+    for _, subset in ipairs(listed) do
+        if not name_subset_problem(ini, subset) then sets[#sets + 1] = subset end
+    end
+    if #sets == 0 then return "" end
     local subset = sets[math.random(#sets)]
     local sec = "stalker_names_" .. subset
-    local ini = system_ini()
-    if not ini:section_exist(sec) then return "" end
     local nc, lc = ini:r_float_ex(sec, "name_cnt"), ini:r_float_ex(sec, "last_name_cnt")
-    if not nc or not lc or nc < 1 or lc < 1 then return "" end
     return game.translate_string("name_" .. subset .. "_" .. math.random(0, nc - 1)) .. " " .. game.translate_string("lname_" .. subset .. "_" .. math.random(0, lc - 1))
 end
 

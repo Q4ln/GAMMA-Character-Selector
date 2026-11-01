@@ -47,7 +47,7 @@ end
 
 local function status(ui)
     -- Keep pack diagnostics in the log; the character panel has no room for a
-    -- technical error dump. Its gender control supplies a short native hint.
+    -- technical error dump, and the gender control shows no hint popup.
     if ui.gcs_error and ui.gcs_error ~= ui.gcs_logged_error then
         printf("[GAMMA Character Selector] %s", ui.gcs_error)
     end
@@ -260,7 +260,10 @@ function refresh(ui, wanted, randomize)
     local candidate = wanted or (same_pool and ui.selected_icon) or (ui.gcs_memory or {})[next_key]
     if randomize and #items > 0 then candidate = items[math.random(#items)] end
     if not contains(items, candidate) then
-        if wanted and wanted ~= "" then ui.gcs_notice = tr("st_gcs_portrait_unavailable") end
+        if wanted and wanted ~= "" then
+            ui.gcs_notice = tr("st_gcs_portrait_unavailable")
+            printf("[GAMMA Character Selector] %s: %s", ui.gcs_notice, tostring(wanted))
+        end
         candidate = items[1]
     end
     ui.table_icon = items -- public GAMMA/NGT controller contract
@@ -489,17 +492,7 @@ function install()
     end
     local previous_update = class.Update
     function class.Update(self, ...)
-        local hint = self.access and self.gcs_gender and self.gcs_gender:IsCursorOverWindow() and self.hint_wnd
-        local timer, text
-        if hint then timer, text = hint.timer, hint.txt end
         local result = previous_update(self, ...)
-        if hint and self.access and hint == self.hint_wnd then
-            -- The stock update clears an unused hint every frame. Restore only
-            -- its delay state so our hover can mature without skipping updates
-            -- from GAMMA, other wrappers, or the inventory controls.
-            hint.timer, hint.txt = timer, text
-            hint:Update(self.gcs_error and tr("st_gcs_unavailable_hint") or self.gcs_notice or tr("st_gcs_gender_hint"))
-        end
         -- After the screen is visible, so the box is not drawn beneath it.
         if self.access and not conflicts_reported then report_conflicts(self) end
         return result

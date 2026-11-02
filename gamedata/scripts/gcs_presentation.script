@@ -62,6 +62,18 @@ local function unhex(value)
     return (value:gsub("%x%x", function(pair) return string.char(tonumber(pair, 16)) end))
 end
 
+-- Runs fn(ini) with pSettings writable in memory (save_at_end is off).
+local function writable(fn)
+    local ini = system_ini()
+    ini:save_at_end(false)
+    ini:set_override_names(true)
+    ini:set_readonly(false)
+    local ok, why = pcall(fn, ini)
+    ini:set_readonly(true)
+    ini:set_override_names(false)
+    return ok, why
+end
+
 -- Reads every recorded key into captured, once per Lua state, before this
 -- state captures anything itself.
 local function load_record()
@@ -102,11 +114,7 @@ end
 
 local function flush_record()
     if #unrecorded == 0 then return true end
-    local ini = system_ini()
-    ini:save_at_end(false)
-    ini:set_override_names(true)
-    ini:set_readonly(false)
-    local ok, why = pcall(function()
+    local ok, why = writable(function(ini)
         for _, key in ipairs(unrecorded) do
             local row, name = captured[key], "k" .. hex(key)
             local payload = row.absent and "A" or "V" .. hex(row.value)
@@ -121,8 +129,6 @@ local function flush_record()
             end
         end
     end)
-    ini:set_readonly(true)
-    ini:set_override_names(false)
     if not ok then return false, "Presentation stock record write failed: " .. tostring(why) end
     unrecorded = {}
     return true
@@ -147,15 +153,39 @@ local function addable(row)
     return entry ~= nil and entry.addable
 end
 
-local function permitted(profile, row)
-    if type(row) ~= "table" or type(row.section) ~= "string" or type(row.key) ~= "string"
-        or type(row.value) ~= "string" or row.value:find("[\r\n]") then return false end
+local function well_formed(row)
+    return type(row) == "table" and type(row.section) == "string" and type(row.key) == "string"
+        and type(row.value) == "string" and not row.value:find("[\r\n]")
+end
+
+-- A pack row may also use a presentation key name of its profile's type, so a
+-- pack can follow sections the table does not list (a child section that
+-- inherits a key, an outfit added later). Such a key is never addable: it
+-- must already exist in its section in the running game.
+local body_class_keys = {actor_visual = true, player_hud_section = true, visual = true, visual_2 = true,
+    item_visual = true, legs_visual = true, hud = true, hud_fov = true, position = true, orientation = true}
+local body_class_prefixes = {"hands_position", "hands_orientation", "item_position", "item_orientation",
+    "aim_hud_offset_", "anm_", "snd_", "scripted_snd_"}
+
+local function key_class(profile, row)
+    if profile.type == "body" then
+        if body_class_keys[row.key] then return true end
+        for _, prefix in ipairs(body_class_prefixes) do
+            if row.key:sub(1, #prefix) == prefix then return true end
+        end
+    elseif profile.type == "voice" then
+        return row.section == "actor_hit_snds" or (row.section == "actor" and row.key:match("^heavy_.*_snd$") ~= nil)
+    end
+    return false
+end
+
+-- A built-in profile uses the exact table only; a pack row may also use a
+-- key class (visual/visual_2 of a private gcs_* HUD section included). The
+-- row must be well formed.
+local function permitted(profile, row, builtin)
     local entry = allowed()[id(row)]
     if entry and entry.type == profile.type then return true end
-    -- A provider can add private HUD sections without widening the gameplay
-    -- key allowlist. The section/key must already exist in mounted pSettings.
-    return profile.type == "body" and row.section:match("^gcs_[a-z0-9_]+$")
-        and (row.key == "visual" or row.key == "visual_2")
+    return not builtin and key_class(profile, row)
 end
 
 local model_keys = {visual = true, visual_2 = true, actor_visual = true, legs_visual = true, item_visual = true}
@@ -189,14 +219,11 @@ end
 local function routes_of(profile)
     local result = {}
     if type(profile) ~= "table" then return result end
-    if type(profile.optional_sound_routes) == "table" then
-        for from, to in pairs(profile.optional_sound_routes) do
-            if type(from) == "string" and resource("sounds", to, ".ogg") then result[from] = to end
-        end
-    end
-    if type(profile.sound_routes) == "table" then
-        for from, to in pairs(profile.sound_routes) do
-            if type(from) == "string" and resource("sounds", to, ".ogg") then result[from] = to end
+    for _, field in ipairs({"optional_sound_routes", "sound_routes"}) do
+        if type(profile[field]) == "table" then
+            for from, to in pairs(profile[field]) do
+                if type(from) == "string" and resource("sounds", to, ".ogg") then result[from] = to end
+            end
         end
     end
     return result
@@ -271,6 +298,93 @@ local function row_problem(profile, row, ini, builtin)
     end
 end
 
+-- Whether a row is usable: (why not, or nil; whether that refuses the
+-- profile). A row outside the table and the key classes is unusable: a
+-- built-in one refuses its profile (the caller checks its section and key),
+-- a pack one only when essential. Any other unusable pack row is dropped, so
+-- one row a newer pack adds for a newer game costs only that row.
+local function screen(profile, row, ini, builtin)
+    local problem = not permitted(profile, row, builtin) and "Presentation key is not allowed: " .. row.section .. "/" .. row.key
+        or not builtin and row_problem(profile, row, ini, false) or nil
+    return problem, problem ~= nil and (builtin or essential(profile, row))
+end
+
+-- A comma-separated list of finite numbers, or nil.
+local function numbers(value)
+    if type(value) ~= "string" then return nil end
+    local list = {}
+    for item in (value .. ","):gmatch("([^,]*),") do
+        local n = tonumber((item:match("^%s*(.-)%s*$")))
+        if not n or n ~= n or n == math.huge or n == -math.huge then return nil end
+        list[#list + 1] = n
+    end
+    return list
+end
+
+-- Whether a stock value (nil when absent) is the one a pack row expects:
+-- numeric lists of one length match within 1e-6 per component, other values
+-- after lowercasing, / -> \, removing whitespace and a trailing .ogf.
+local function same_stock(a, b)
+    if a == nil or b == nil then return a == b end
+    local x, y = numbers(a), numbers(b)
+    if x and y and #x == #y then
+        for i = 1, #x do
+            if math.abs(x[i] - y[i]) > 1e-6 then return false end
+        end
+        return true
+    end
+    local function plain(value) return (value:lower():gsub("/", "\\"):gsub("%s", ""):gsub("%.ogf$", "")) end
+    return plain(a) == plain(b)
+end
+
+local function trimmed(n)
+    local text = string.format("%.6f", n):gsub("0+$", ""):gsub("%.$", "")
+    return text == "-0" and "0" or text
+end
+
+local function address(row) return row.section .. "|" .. row.key end
+
+-- expects, on_stale_rows and deltas name rows of the profile as section|key;
+-- on_stale and on_stale_rows hold a policy. Shapes only: the stock values are
+-- compared when a gender is applied (prepare).
+local policies = {keep = true, drop = true, pin = true}
+local function stale_shape(profile, rows)
+    for _, field in ipairs({"expects", "on_stale_rows", "deltas"}) do
+        local map = profile[field]
+        if map ~= nil and type(map) ~= "table" then return false, "Presentation " .. field .. " must be a mapping" end
+        for name, value in pairs(map or {}) do
+            if type(name) ~= "string" or type(value) ~= "string" then
+                return false, "Invalid presentation " .. field .. " entry: " .. tostring(name)
+            end
+            if rows[name] == nil then return false, "Presentation " .. field .. " names no row of the profile: " .. name end
+        end
+    end
+    if profile.on_stale ~= nil and not policies[profile.on_stale] then
+        return false, "Presentation on_stale must be keep, drop or pin: " .. tostring(profile.on_stale)
+    end
+    for name, policy in pairs(profile.on_stale_rows or {}) do
+        if not policies[policy] then return false, "Presentation on_stale_rows must be keep, drop or pin: " .. name end
+    end
+    for name, delta in pairs(profile.deltas or {}) do
+        local expected = (profile.expects or {})[name]
+        if expected == nil then return false, "Presentation delta has no expects entry: " .. name end
+        local value, step, base = numbers(rows[name]), numbers(delta), numbers(expected)
+        if not value or not step or not base or #value ~= #step or #step ~= #base then
+            return false, "Presentation delta needs numeric value, delta and expects of one length: " .. name
+        end
+    end
+    return true
+end
+
+-- A route's shape: a non-empty name and a relative target with no list separator.
+local function bad_route(from, to)
+    return type(from) ~= "string" or from == "" or type(to) ~= "string" or to == ""
+        or to:find("..", 1, true) or to:find(":", 1, true) or to:find("[%c,]")
+end
+
+-- Rows a validated profile can use, by profile ID, for the coverage line.
+local row_counts = {}
+
 function validate_profile(profile)
     if profile.type == "names" or profile.type == "dialogue" then return true end
     if profile.type ~= "body" and profile.type ~= "voice" and profile.type ~= "movement" and profile.type ~= "health" then
@@ -287,25 +401,28 @@ function validate_profile(profile)
         row_count = row_count + 1
     end
     if row_count ~= #(profile.values or {}) then return false, "Presentation values contain a missing row" end
-    -- A built-in profile (Male) is GAMMA's stock. prepare never writes its
-    -- rows' values, only the running game's stock record, so they are checked
-    -- only for what is used: a section or key the running game lacks drops
-    -- that row (prepare skips it), and no value check applies. A pack row the
-    -- running game cannot use is dropped the same way, with its reason, unless
-    -- it is essential; prepare skips exactly the rows dropped here.
+    -- A built-in profile (Male) is GAMMA's stock: prepare writes the running
+    -- game's stock record, never its rows' values, so a built-in row is only
+    -- dropped for a section or key the running game lacks. prepare skips
+    -- exactly the rows dropped here.
     local builtin = is_builtin(profile)
-    local seen, ini = {}, system_ini()
+    local seen, ini, rows, dropped = {}, system_ini(), {}, 0
     for _, row in ipairs(profile.values or {}) do
-        if not permitted(profile, row) then return false, "Presentation key is not allowed: " .. tostring(row.section) .. "/" .. tostring(row.key) end
+        if not well_formed(row) then return false, "Presentation key is not allowed: " .. tostring(row.section) .. "/" .. tostring(row.key) end
+        local problem, fatal = screen(profile, row, ini, builtin)
+        if fatal and builtin then return false, problem end
         if seen[id(row)] then return false, "Duplicate presentation key: " .. id(row) end
         seen[id(row)] = true
-        local problem = row_problem(profile, row, ini, builtin)
+        rows[address(row)] = row.value
+        if fatal then return false, problem end
+        if builtin then problem = row_problem(profile, row, ini, true) end
         if problem then
-            if builtin then drop_row(profile, row)
-            elseif essential(profile, row) then return false, problem
-            else drop_row(profile, row, problem) end
+            dropped = dropped + 1
+            drop_row(profile, row, not builtin and problem or nil)
         end
     end
+    local shaped, shape_error = stale_shape(profile, rows)
+    if not shaped then return false, shape_error end
     -- Male's no-outfit body is the engine's (server_visual), not this value.
     if profile.type == "body" and not builtin and not resource("meshes", profile.server_visual, ".ogf") then
         return false, "Missing no-outfit server model: " .. tostring(profile.server_visual)
@@ -316,18 +433,12 @@ function validate_profile(profile)
     -- A required route keeps the map shape; one whose target is not installed
     -- is dropped (routes_of skips it) and the stock sound plays.
     for from, to in pairs(profile.sound_routes or {}) do
-        if type(from) ~= "string" or from == "" or type(to) ~= "string" or to == ""
-            or to:find("..", 1, true) or to:find(":", 1, true) or to:find("[%c,]") then
-            return false, "Invalid sound route: " .. tostring(from)
-        end
+        if bad_route(from, to) then return false, "Invalid sound route: " .. tostring(from) end
         if not resource("sounds", to, ".ogg") then drop_route(profile, from, to) end
     end
     -- An optional target may be absent; its shape is still checked.
     for from, to in pairs(profile.optional_sound_routes or {}) do
-        if type(from) ~= "string" or from == "" or type(to) ~= "string" or to == ""
-            or to:find("..", 1, true) or to:find(":", 1, true) or to:find("[%c,]") then
-            return false, "Invalid optional sound route: " .. tostring(from)
-        end
+        if bad_route(from, to) then return false, "Invalid optional sound route: " .. tostring(from) end
         if profile.sound_routes and profile.sound_routes[from] ~= nil then
             return false, "Sound route is both required and optional: " .. from
         end
@@ -347,7 +458,38 @@ function validate_profile(profile)
             if type(name) ~= "string" or type(texture_id) ~= "string" then return false, "Invalid health window mapping" end
         end
     end
+    row_counts[tostring(profile.id)] = {total = row_count, dropped = dropped}
     return true
+end
+
+-- Once per Lua state, for a pack gender that validates (gcs_registry calls
+-- this): how many body rows the running game can use, and how many sections
+-- with an actor_visual line (outfits) the body profile has no row for, so an
+-- outfit a later game adds shows up in the log. Built-in genders print nothing.
+local coverage_reported = {}
+function report_coverage(gender)
+    local body = type(gender) == "table" and type(gender.profiles) == "table" and gender.profiles.body
+    if type(body) ~= "table" or is_builtin(body) or coverage_reported[tostring(gender.id)] or not printf then return end
+    local counts = row_counts[tostring(body.id)]
+    if not counts then
+        if validate_profile(body) ~= true then return end
+        counts = row_counts[tostring(body.id)]
+    end
+    local uncovered, ini = "?", system_ini()
+    if type(ini.section_for_each) == "function" then
+        local outfits = {}
+        for _, row in ipairs(body.values or {}) do
+            if type(row) == "table" and row.key == "actor_visual" then outfits[tostring(row.section)] = true end
+        end
+        local count = 0
+        ini:section_for_each(function(section)
+            if not outfits[section] and ini:line_exist(section, "actor_visual") then count = count + 1 end
+        end)
+        uncovered = tostring(count)
+    end
+    coverage_reported[tostring(gender.id)] = true
+    printf("[GCS] coverage %s: %s/%s body rows usable, %s dropped; %s outfits with actor_visual have no row",
+        tostring(gender.id), tostring(counts.total - counts.dropped), tostring(counts.total), tostring(counts.dropped), uncovered)
 end
 
 -- An addable key that stock lacks is captured as absent; restoring that
@@ -414,44 +556,83 @@ local function route_use_sounds(gender, ini, rows)
     return true
 end
 
+-- The row to write for a pack row, given its true stock row, or nil once it
+-- is dropped. A row with an expects entry was made for that stock value. When
+-- the running game's stock differs, a row with a delta follows it (stock plus
+-- delta); otherwise its policy applies: keep writes the pack value, drop
+-- leaves stock, pin skips the comparison. The profile's row tables are
+-- cached by the registry and never changed: a followed row is a copy.
+local function checked(profile, row, stock, tally)
+    local name = address(row)
+    local expected = type(profile.expects) == "table" and profile.expects[name] or nil
+    if expected == nil then return row end
+    local policy = type(profile.on_stale_rows) == "table" and profile.on_stale_rows[name] or profile.on_stale or "keep"
+    if policy == "pin" then return row end
+    local value = not stock.absent and stock.value or nil
+    if same_stock(value, expected ~= "@absent" and expected or nil) then return row end
+    local delta = type(profile.deltas) == "table" and profile.deltas[name] or nil
+    local base, step = numbers(value), numbers(delta)
+    if delta and base and step and #base == #step then
+        local parts = {}
+        for i = 1, #base do parts[i] = trimmed(base[i] + step[i]) end
+        tally.followed = tally.followed + 1
+        return {section = row.section, key = row.key, value = table.concat(parts, ", ")}
+    end
+    -- Stale: dropped for a delta the stock cannot take or a drop policy, else kept.
+    local reason = delta and "made for a different stock value, and the stock value is not a list of " .. #(step or {}) .. " numbers"
+        or policy == "drop" and "made for a different stock value" or nil
+    local outcome = reason and "dropped" or "kept"
+    tally[outcome] = tally[outcome] + 1
+    tally.first = tally.first or row.section .. "/" .. row.key
+    if not reason then return row end
+    drop_row(profile, row, reason)
+    return nil
+end
+
+-- One line per profile per Lua state when any row was stale (kept or
+-- dropped); a followed delta is not stale and is never the first row named.
+local stale_reported = {}
+local function report_stale(profile, tally)
+    local stale = tally.kept + tally.dropped
+    if stale == 0 or stale_reported[tostring(profile.id)] or not printf then return end
+    stale_reported[tostring(profile.id)] = true
+    local counts = "kept " .. tally.kept .. ", dropped " .. tally.dropped
+    if tally.followed > 0 then counts = counts .. ", followed " .. tally.followed end
+    printf("[GCS] %s: %s rows were made for a different stock value (%s); first: %s", tostring(profile.id),
+        tostring(stale), counts, tostring(tally.first))
+end
+
 local function prepare(gender)
     if type(gender) ~= "table" or type(gender.profiles) ~= "table" then return nil, "Resolved gender is required" end
     local loaded, load_error = load_record()
     if not loaded then return nil, load_error end
-    local rows = {}
+    local ini, rows = system_ini(), {}
     for _, typ in ipairs({"body", "voice"}) do
         local profile = gender.profiles[typ]
         if not profile then return nil, "Missing " .. typ .. " profile" end
-        -- A built-in profile (Male) is GAMMA's stock. Its rows are the values
-        -- the generator read from one modpack definition; it writes the
-        -- running game's stock record instead, so a GAMMA update or another
-        -- mod that changes one of these keys leaves Male equal to stock.
-        -- A built-in row whose section or key the running game lacks is
-        -- dropped (validate_profile): there is no stock value to write. A
-        -- pack row is dropped for the same reasons validate_profile drops it,
-        -- so no value naming a missing model, HUD section or sound is written.
+        -- A built-in profile (Male) writes the running game's stock record,
+        -- not the values the generator read, so a GAMMA update or another mod
+        -- that changes one of these keys leaves Male equal to stock; a row with
+        -- no stock value is dropped. Pack rows are screened as validate_profile screens them.
         local stock = is_builtin(profile)
-        local ini = system_ini()
+        local tally = {kept = 0, dropped = 0, followed = 0}
         for _, row in ipairs(profile.values or {}) do
-            if not permitted(profile, row) then return nil, "Presentation key is not allowed: " .. id(row) end
-            local problem = not stock and row_problem(profile, row, ini, false)
-            if problem then
-                if essential(profile, row) then return nil, problem end
-                drop_row(profile, row, problem)
-            else
-                local ok, why = capture(row)
-                if ok then rows[id(row)] = stock and captured[id(row)] or row
-                elseif stock then drop_row(profile, row)
-                else return nil, why end
-            end
+            if not well_formed(row) then return nil, "Presentation key is not allowed: " .. id(row) end
+            local problem, fatal = screen(profile, row, ini, stock)
+            if fatal then return nil, problem end
+            if problem then drop_row(profile, row, problem)
+            -- Only a built-in row can fail here: a pack row passed row_problem.
+            elseif not capture(row) then drop_row(profile, row)
+            elseif stock then rows[id(row)] = captured[id(row)]
+            else rows[id(row)] = checked(profile, row, captured[id(row)], tally) end
         end
+        if not stock then report_stale(profile, tally) end
     end
-    local routed, route_error = route_use_sounds(gender, system_ini(), rows)
+    local routed, route_error = route_use_sounds(gender, ini, rows)
     if not routed then return nil, route_error end
     -- Include every allowlisted key so switching to a partial custom profile
     -- cannot leave another life's body/voice keys behind. A key that neither
     -- exists nor may be added can never have been written, so it is skipped.
-    local ini = system_ini()
     for key, entry in pairs(allowed()) do
         if captured[key] == nil then
             local section, name = key:match("^(.-)\t(.*)$")
@@ -501,11 +682,7 @@ function signature(gender)
 end
 
 local function write(rows)
-    local ini = system_ini()
-    ini:save_at_end(false)
-    ini:set_override_names(true)
-    ini:set_readonly(false)
-    local ok, why = pcall(function()
+    return writable(function(ini)
         for _, key in ipairs(ordered(rows)) do
             local row = rows[key]
             local present = ini:line_exist(row.section, row.key)
@@ -516,9 +693,6 @@ local function write(rows)
             end
         end
     end)
-    ini:set_readonly(true)
-    ini:set_override_names(false)
-    return ok, why
 end
 
 function apply(gender)
@@ -576,13 +750,7 @@ function record_server_visual(visual)
     if type(visual) ~= "string" or visual == "" or visual:find("%c") or #visual * 2 + 1 > RECORD_CHUNK then
         return false, "Invalid engine actor visual: " .. tostring(visual)
     end
-    local ini = system_ini()
-    ini:save_at_end(false)
-    ini:set_override_names(true)
-    ini:set_readonly(false)
-    local ok, why = pcall(function() ini:w_string(STOCK_RECORD, SERVER_VISUAL, "V" .. hex(visual)) end)
-    ini:set_readonly(true)
-    ini:set_override_names(false)
+    local ok, why = writable(function(ini) ini:w_string(STOCK_RECORD, SERVER_VISUAL, "V" .. hex(visual)) end)
     if not ok then return false, "Engine actor visual record write failed: " .. tostring(why) end
     return true
 end

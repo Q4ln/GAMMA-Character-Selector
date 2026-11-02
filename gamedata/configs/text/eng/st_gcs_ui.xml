@@ -18,7 +18,8 @@
   <string id="gcs_azazel_checkpoint_failed"><text>Character transfer finished, but its checkpoint save could not be made or loaded. Load an earlier save.</text></string>
   <string id="gcs_azazel_transfer_incomplete"><text>Character transfer did not complete. Load an earlier save.</text></string>
   <string id="st_gcs_refresh_name"><text>Generate another name</text></string>
-  <string id="st_gcs_no_gender"><text>No gender is available for a new character. Enable a character pack (Female needs the LASS GAMMA Rebase) and restart the game.</text></string>
+  <string id="st_gcs_no_gender"><text>No gender is available for a new character. Enable a gender pack and restart the game.</text></string>
   <string id="st_gcs_package_conflict"><text>Incompatible character files are installed. Characters that depend on them stay unavailable until they are removed:</text></string>
-  <string id="gcs_lass_conflict"><text>The old overwriting LASS GAMMA Rebase or original LASS files are installed. They overwrite GAMMA's own files, so no character can be created or loaded until they are removed. Install the current LASS GAMMA Rebase to play Female</text></string>
+  <string id="gcs_lass_conflict"><text>Files of a mod that overwrites GAMMA's own player files are installed, so no character can be created or loaded until they are removed</text></string>
+  <string id="st_gcs_needs_newer_selector"><text>Needs a newer GAMMA Character Selector.</text></string>
 </string_table>

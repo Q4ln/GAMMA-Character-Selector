@@ -2,9 +2,13 @@
 -- source, not a dependency on another add-on or its controller extensions.
 local SECTION, LEGACY = "gcs_character_templates_v1", "flx_new_game_templates"
 local LIMIT, CHUNK, MAX_PARTS = 24, 1200, 32
-local fields={"character_name","faction","gender","icon","map","difficulty","economy","money","loadout","story","hardcore","azazel","survival","warfare","campfire","conditions","routes","hardcore_lives","hardcore_regen","timer","soulslike"}
-local modes={story="ck_story",hardcore="ck_hardcore",azazel="ck_azazel_mode",survival="ck_survival",warfare="ck_warfare",campfire="ck_campfire",conditions="ck_conditions",routes="ck_routes",soulslike="ck_soulslike_mode"}
-local mode_order={"story","hardcore","azazel","survival","warfare","soulslike","campfire","conditions","routes"}
+local fields={"character_name","faction","gender","icon","map","difficulty","economy","money","loadout","story","hardcore","azazel","survival","warfare","campfire","conditions","routes","hardcore_lives","hardcore_regen","timer","soulslike","opportunist_empty"}
+local modes={story="ck_story",hardcore="ck_hardcore",azazel="ck_azazel_mode",survival="ck_survival",warfare="ck_warfare",campfire="ck_campfire",conditions="ck_conditions",routes="ck_routes",soulslike="ck_soulslike_mode",opportunist_empty="ck_opportunist_empty"}
+local mode_order={"story","hardcore","azazel","survival","warfare","soulslike","campfire","conditions","routes","opportunist_empty"}
+-- Another mod's check added after records existed (Opportunist's Start With
+-- Nothing). A record without it reads as unticked, and a card names it only
+-- while the screen has the check.
+local optional={opportunist_empty=true}
 local factions={stalker=true,bandit=true,csky=true,dolg=true,freedom=true,killer=true,army=true,ecolog=true,monolith=true,renegade=true,greh=true,isg=true,zombied=true}
 local installed=false
 local function pack(...) return {n=select("#",...),...} end
@@ -47,7 +51,7 @@ function deserialize(raw)
     if not own and version~="1" and version~="2" and version~="3" then return nil,"Unsupported legacy template format" end
     if own or version=="3" then
         for _,key in ipairs(fields) do
-            if result[key]==nil and (own or key~="gender") then return nil,"Incomplete template: "..key end
+            if result[key]==nil and (own or key~="gender") and not optional[key] then return nil,"Incomplete template: "..key end
         end
     else
         if result.loadout then result.loadout=result.loadout:gsub("%%%%%%02X",",") end
@@ -215,7 +219,9 @@ function apply(ui,data)
     if checks.soulslike then checks.azazel=false;checks.hardcore=false end
     for name,control in pairs(modes) do
         if ui[control] then ui[control]:SetCheck(checks[name]) end
-        if ui.ck_states then ui.ck_states[control]=false end
+        -- Only reset hint entries the screen has: a new entry would give a
+        -- check that stays out of the hint table a hover popup.
+        if ui.ck_states and ui.ck_states[control]~=nil then ui.ck_states[control]=false end
     end
     if ui.ck_story then ui.ck_story:Enable(faction~="zombied") end
     ui:UpdateAll(false,faction)
@@ -362,7 +368,7 @@ local function refresh_list(ui,selected)
         location:SetText(tr("location_label")..": "..translated(data.map,"ui_st_"));location:SetEllipsis(true)
         local enabled={}
         for _,key in ipairs(mode_order) do
-            if mode_enabled(data[key]) then enabled[#enabled+1]=tr("mode_"..key) end
+            if mode_enabled(data[key]) and (not optional[key] or ui[modes[key]]) then enabled[#enabled+1]=tr("mode_"..key) end
         end
         -- One native text flow uses the actual font and available width. There
         -- are no reserved columns or per-option positions to leave gaps.

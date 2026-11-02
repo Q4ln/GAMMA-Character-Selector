@@ -25,6 +25,13 @@ kind = package
 id = lass_original_trio
 probe = configs|ui\textures_descr\ui_animated_female_original_trio.xml
 
+[gcs_api_2_package]
+kind = package
+id = gcs_api_2
+; Pack format level 2: key classes, writes_more, expects, on_stale, on_stale_rows and deltas.
+; A pack that relies on them may require gcs_api_2, so an older Selector refuses it instead.
+requires = gcs
+
 [gcs_npc_builtin]
 kind = npc_map
 entries = gcs_specific_characters

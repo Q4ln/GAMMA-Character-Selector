@@ -163,4 +163,7 @@ Name your current setup above, then press Save.</text>
   <string id="st_gcs_templates_mode_routes">
     <text>Accessible Zone</text>
   </string>
+  <string id="st_gcs_templates_mode_opportunist_empty">
+    <text>Start With Nothing</text>
+  </string>
 </string_table>

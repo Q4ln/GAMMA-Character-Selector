@@ -70,19 +70,23 @@ local function definition_shape(data, kind)
     for _, field in ipairs({"default_subsets", "military_subsets"}) do
         if not string_list(data[field]) then return false, "Invalid " .. field .. " in profile:" .. tostring(data.id) end
     end
-    if data.values ~= nil then
-        if type(data.values) ~= "table" then return false, "Invalid values list in profile:" .. tostring(data.id) end
-        local count, maximum = 0, 0
-        for index, row in pairs(data.values) do
-            if type(index) ~= "number" or index < 1 or index ~= math.floor(index) or type(row) ~= "table" then
-                return false, "Invalid values entry in profile:" .. tostring(data.id)
+    -- values_more (LTX writes_more) holds rows in the same shape as values.
+    for _, field in ipairs({"values", "values_more"}) do
+        local rows = data[field]
+        if rows ~= nil then
+            if type(rows) ~= "table" then return false, "Invalid " .. field .. " list in profile:" .. tostring(data.id) end
+            local count, maximum = 0, 0
+            for index, row in pairs(rows) do
+                if type(index) ~= "number" or index < 1 or index ~= math.floor(index) or type(row) ~= "table" then
+                    return false, "Invalid " .. field .. " entry in profile:" .. tostring(data.id)
+                end
+                if type(row.section) ~= "string" or row.section == "" or type(row.key) ~= "string" or row.key == "" or type(row.value) ~= "string" then
+                    return false, "Invalid INI row in profile:" .. tostring(data.id)
+                end
+                count, maximum = count + 1, math.max(maximum, index)
             end
-            if type(row.section) ~= "string" or row.section == "" or type(row.key) ~= "string" or row.key == "" or type(row.value) ~= "string" then
-                return false, "Invalid INI row in profile:" .. tostring(data.id)
-            end
-            count, maximum = count + 1, math.max(maximum, index)
+            if count ~= maximum then return false, "Sparse " .. field .. " list in profile:" .. tostring(data.id) end
         end
-        if count ~= maximum then return false, "Sparse values list in profile:" .. tostring(data.id) end
     end
     for _, field in ipairs({"sound_routes", "optional_sound_routes", "textures", "windows", "routes", "text_eng", "text_rus"}) do
         if data[field] ~= nil then
@@ -222,8 +226,18 @@ local function conflict_reason(p, id, conflict)
     return message .. " [" .. id .. ": " .. conflict .. "]"
 end
 
+-- gcs_api_<n> packages name what this Selector's pack format provides (the
+-- generated catalog registers them). A pack that requires a level this
+-- Selector does not register needs a newer Selector.
+local function needs_newer_selector()
+    local message = "Needs a newer GAMMA Character Selector."
+    if game and game.translate_string then message = game.translate_string("st_gcs_needs_newer_selector") end
+    return message
+end
+
 local function package_ok(id, visiting)
     local p = packages[id]
+    if not p and type(id) == "string" and id:match("^gcs_api_%d+$") then return false, needs_newer_selector() end
     if not p or conflicts["package:" .. id] then return false, "Missing or conflicting package: " .. tostring(id) end
     visiting = visiting or {}
     if visiting[id] then return false, "Package dependency cycle: " .. id end
@@ -377,16 +391,6 @@ local function validate_data_profile(profile)
             end
         end
     end
-    for _, field in ipairs({"text_eng", "text_rus"}) do
-        if profile[field] ~= nil then
-            if type(profile[field]) ~= "table" then return false, "Invalid " .. field .. " map: " .. profile.id end
-            for from, to in pairs(profile[field]) do
-                if type(from) ~= "string" or from == "" or type(to) ~= "string" or to == "" then
-                    return false, "Invalid " .. field .. " entry: " .. profile.id
-                end
-            end
-        end
-    end
     local provided
     if profile.text_provider ~= nil then
         if profile.type ~= "dialogue" then return false, "text_provider requires a dialogue profile: " .. profile.id end
@@ -456,6 +460,13 @@ local function resolve(store, kind, id, visiting)
     end
     local result = merge(parent, item)
     visiting[key] = nil
+    if kind == "profile" and result.values_more ~= nil then
+        -- writes_more rows follow the profile's own writes rows or, without
+        -- them, the inherited ones. merge returned copies.
+        local values = result.values or {}
+        for _, row in ipairs(result.values_more) do values[#values + 1] = row end
+        result.values, result.values_more = values, nil
+    end
     local ok, why = dependencies(result)
     if not ok then return nil, why end
     if kind == "profile" then
@@ -598,6 +609,10 @@ function validate_gender(id)
     if gender.enabled == false or gender.enabled == "false" then return false, "Gender is disabled: " .. id end
     for _, faction in ipairs(factions) do
         if #pool(id, faction) == 0 then return false, "No valid portraits: " .. id .. "/" .. faction end
+    end
+    -- A pack gender's coverage line, once per Lua state; it never decides validity.
+    if gcs_presentation and type(gcs_presentation.report_coverage) == "function" then
+        pcall(gcs_presentation.report_coverage, gender)
     end
     return true
 end
@@ -765,6 +780,28 @@ local function fields(ini, section)
     return data
 end
 
+-- A section of section|key = value lines, as rows sorted by section and key.
+local function write_rows(ini, section)
+    local rows = {}
+    for address, value in pairs(fields(ini, section)) do
+        local bits = split(address, "|")
+        rows[#rows + 1] = {section = bits[1], key = bits[2], value = value}
+    end
+    table.sort(rows, function(a, b) return a.section .. a.key < b.section .. b.key end)
+    return rows
+end
+
+-- A section of section|key = text lines, keyed section|key as writes rows
+-- name them (the address trimmed around "|").
+local function address_map(ini, section)
+    local map = {}
+    for address, value in pairs(fields(ini, section)) do
+        local bits = split(address, "|")
+        map[tostring(bits[1]) .. "|" .. tostring(bits[2])] = value
+    end
+    return map
+end
+
 local function read_profile(ini, data)
     if data.builtin then
         local builtin = gcs_builtin_presentation.get(data.builtin)
@@ -773,14 +810,15 @@ local function read_profile(ini, data)
     for _, key in ipairs({"sound_routes", "optional_sound_routes", "textures", "windows", "routes", "text_eng", "text_rus"}) do
         if type(data[key]) == "string" then data[key] = fields(ini, data[key]) end
     end
-    if data.writes then
-        data.values = {}
-        for address, value in pairs(fields(ini, data.writes)) do
-            local bits = split(address, "|")
-            data.values[#data.values + 1] = {section = bits[1], key = bits[2], value = value}
-        end
-        table.sort(data.values, function(a, b) return a.section .. a.key < b.section .. b.key end)
+    -- Rows made for one stock value (expects, deltas, on_stale_rows); see
+    -- gcs_presentation. Selectors before these fields ignore them.
+    for _, key in ipairs({"expects", "deltas", "on_stale_rows"}) do
+        if type(data[key]) == "string" then data[key] = address_map(ini, data[key]) end
     end
+    if data.writes then data.values = write_rows(ini, data.writes) end
+    -- writes_more is read like writes; its rows follow the profile's values
+    -- (its own writes rows, or the inherited ones) when it resolves.
+    if data.writes_more then data.values_more = write_rows(ini, data.writes_more) end
     return data
 end
 

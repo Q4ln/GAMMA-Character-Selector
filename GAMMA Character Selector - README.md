@@ -1,6 +1,6 @@
 # GAMMA Character Selector
 
-Version `d2026.11.1.2`
+Version `d2026.11.2.1`
 
 A character creator for G.A.M.M.A. On the New Game screen you choose a gender,
 a portrait from that gender's faction pool and a generated name, and the
@@ -26,14 +26,15 @@ separate mods that register them with the Selector, and you can define your own
   settings). If Start is refused, a message box gives the reason.
 - **Last settings.** New Game remembers every choice you made on it: name,
   faction, gender, portrait, starting location, both difficulties, loadout and
-  game modes. Back, Escape and a successful Start save them; a refused Start
+  game modes, and also Opportunist's Start With Nothing option when that mod is
+  installed. Back, Escape and a successful Start save them; a refused Start
   does not. The screen opens with them the next time, also after a restart.
 - **Presets.** 24 named preset slots. The **Presets** button lists saved
-  presets; **New** saves the current setup under a name, and a saved preset can
-  be applied, updated or deleted (updating and deleting ask for a second
-  click). Cards show the saved portrait (animated when it is), faction icon,
-  name, gender, both difficulties, the starting location and the enabled
-  options.
+  presets; **New** saves the current setup (the same choices as Last settings)
+  under a name, and a saved preset can be applied, updated or deleted
+  (updating and deleting ask for a second click). Cards show the saved
+  portrait (animated when it is), faction icon, name, gender, both
+  difficulties, the starting location and the enabled options.
 - **Male** uses GAMMA's own bodies, hands, player voice, movement sounds, health
   HUD, text and NPC recordings at their stock paths. Its shared portrait list
   holds neutral **No Data**.
@@ -84,8 +85,8 @@ separate mods that register them with the Selector, and you can define your own
 ## Requirements
 
 - S.T.A.L.K.E.R. Anomaly 1.5.3.
-- G.A.M.M.A., modpack definition 920 (built and checked against it; not tested
-  in game yet, see Known issues), with its MCM, DLTX and DXML.
+- G.A.M.M.A., modpack definition 920 (built and checked against it; only
+  briefly tested in game, see Known issues), with its MCM, DLTX and DXML.
 - The Modded Exes build that GAMMA installs. Stock Anomaly executables are not
   supported: the Selector needs the modded engine's DXML, in-memory settings,
   save-load and server-packet interfaces.
@@ -157,6 +158,10 @@ Saves made with rc15:
   lacks is skipped, not a reason to hide the gender (see Options).
 - **New Game Templates.** Superseded by the built-in presets; do not enable it
   alongside the Selector. Its stored presets stay readable and untouched.
+- **Opportunist.** Last settings and presets remember its Start With Nothing
+  option, and a preset card lists it only while Opportunist is installed.
+  Neither mod needs the other. Last settings and presets saved by an earlier
+  Selector build load with the option unticked.
 - **Azazel mode.** The Selector replaces Anomaly's
   `gamedata/scripts/gamemode_azazel.script`. Candidate selection, warfare
   options, task failure, equipment creation, the grace period and the cross-map
@@ -248,6 +253,14 @@ so is anything a pack lists in `resources`: ship them in your pack. If one of
 these is missing, that gender is left out of the New Game screen and the log
 says why on a `Gender unavailable` line.
 
+A pack's body or voice row with a key the Selector does not handle is skipped
+the same way (`Presentation key is not allowed`), except a body row on those
+three player sections, which leaves the gender out. Packs may also use
+`writes_more` (more rows), `expects` with `on_stale` or `on_stale_rows` (the
+GAMMA value a row was made for, and whether to keep, drop or pin it when the
+game differs) and `deltas` (offsets added to a changed value); a pack that
+relies on them can add `gcs_api_2` to its `requires`.
+
 ## Adding or removing mid-save
 
 - **Adding the Selector to an existing game:** older saves load unchanged as
@@ -277,20 +290,38 @@ it is not supported.
 
 ## Known issues
 
-- Nothing in this build has been tested in game yet. The build before it,
-  which differs only in still showing a hint popup on the gender control, was
-  checked in game at the main menu, where the New Game list and the new pack
-  checks worked. That build changed how gender packs are checked; component
-  tests cover that against GAMMA's real files,
-  also with 3DSS's scope sections, Voiced Actor's hunger and thirst lines and
-  Oleh's hit sounds taken away. Of the code it shares with earlier builds, your
-  own inventory portrait was checked in one save at 1920x1080, and a build
-  without the inventory portrait fix was played for a short while in a new
-  game with a gender from a gender pack. Male, which the Selector offers on its
-  own, has not been played in game since it moved to GAMMA's own files.
-  Everything else, including the other side's inventory portrait and other
-  screen shapes, is covered by component tests only. Report problems with the
-  newest `xray_*.log` from Anomaly's `appdata\logs` folder.
+- This build was only briefly tested in game, with a gender pack installed. A
+  test script opened New Game twice with the remembered last settings (a gender
+  from the gender pack, with the remembered Start With Nothing option ticked)
+  and started one new game with those settings and one after unticking that
+  option; both reached the starting level and ran for about 12 seconds. New
+  Game later opened again with an older remembered setup. The logs of these
+  runs showed no errors from the Selector. Two earlier copies of this build,
+  both made before its last code changes, reached the main menu with the same
+  gender pack; the second one's scripts for gender packs and NPC voices are the
+  same as this build's. The pack's gender was listed and valid, all 768 of its
+  body settings applied and read back as written, switching to Male returned
+  every changed setting to GAMMA's value, and a deliberately altered copy of
+  the pack showed an offset following GAMMA's value, a mismatched setting kept
+  and logged, and an unknown setting skipped. The second copy also loaded,
+  through the console (`start server`, which skips the Load menu's checks), a
+  save of the pack's gender made with the pack's previous build: the game
+  reported that gender and its voice profile, and the weapon-inspection voice
+  line resolved to the pack's recordings through Voiced Actor Refined, with no
+  errors from the Selector. Two builds earlier, the build that started skipping
+  the gender pack settings your GAMMA lacks was checked in game at the main
+  menu, where the New Game list and those pack checks worked; component tests
+  cover them against GAMMA's real files, also with 3DSS's scope sections,
+  Voiced Actor's hunger and thirst lines and Oleh's hit sounds taken away. Of
+  the code this build shares with earlier builds, your own inventory portrait
+  was checked in one save at 1920x1080, and a build without the inventory
+  portrait fix was played for a short while in a new game with a gender from a
+  gender pack. Male, which the Selector offers on its own, has not been played
+  in game since it moved to GAMMA's own files, and longer play has not been
+  tested. The reworded messages and the NPC voice fallback have not been
+  checked in game. Everything else, including the other side's inventory
+  portrait and other screen shapes, is covered by component tests only. Report
+  problems with the newest `xray_*.log` from Anomaly's `appdata\logs` folder.
 - The console commands `load`, `load_last_save` and `start server(...)` bypass
   the Load menu's checks, so a save the Selector would refuse is loaded anyway
   (a body model that is no longer installed is replaced by GAMMA's no-outfit
@@ -303,6 +334,31 @@ it is not supported.
   character's gender are text only: the NPC stays silent for them.
 
 ## Changelog
+
+### d2026.11.2.1
+
+- A gender pack's setting that the Selector does not handle is now skipped
+  and logged instead of hiding the gender. The pack's body, first-person legs
+  and hands, no-outfit model and health-HUD atlas, and its own dialogue files,
+  are still required.
+- Gender packs can follow GAMMA without a Selector update. A pack can now give
+  its settings to sections that inherit them from another section, and can
+  name the GAMMA value each setting was made for. When your GAMMA's value
+  differs, the pack's setting is kept and the `xray_*.log` notes it, unless
+  the pack says otherwise; an offset the pack gives as a correction is added
+  to your GAMMA's value instead.
+- A gender from a pack that needs a newer Selector is reported as "Needs a
+  newer GAMMA Character Selector."
+- An NPC voice line whose recording is not installed now plays GAMMA's own
+  recording of that line, when there is one; the build before left the pack's
+  whole voice set for those lines out.
+- The messages shown when no gender is available and when files that
+  overwrite GAMMA's player files are installed are reworded.
+- The `xray_*.log` now has a line for each available gender whose body comes
+  from a gender pack, counting how many of its body settings your GAMMA can
+  use and how many outfits it has no body model for.
+- Last settings and presets also remember Opportunist's Start With Nothing
+  option when that mod is installed.
 
 ### d2026.11.1.2
 
